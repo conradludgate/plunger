@@ -43,7 +43,7 @@ unsafe impl<Ctx> Sync for Plunger<Ctx> {}
 
 impl Plunger {
     pub fn new() -> Arc<Self> {
-        let t = std::thread::available_parallelism().unwrap_or(NonZero::new(4).unwrap());
+        let t = std::thread::available_parallelism().unwrap_or(const { NonZero::new(4).unwrap() });
         Self::with_threads(t)
     }
 
@@ -80,7 +80,7 @@ impl<Ctx> Plunger<Ctx> {
         for ctx in ctx {
             threads += 1;
             let this = this.clone();
-            std::thread::spawn(|| this.worker(ctx));
+            std::thread::spawn(move || this.worker(ctx));
         }
 
         assert!(threads > 0, "no threads spawned");
@@ -112,7 +112,7 @@ impl<Ctx> Plunger<Ctx> {
         }
     }
 
-    fn worker(self: Arc<Self>, ctx: impl FnOnce() -> Ctx) {
+    fn worker(&self, ctx: impl FnOnce() -> Ctx) {
         let mut ctx = ctx();
         let mut queue = self.queue.lock().unwrap();
         loop {
@@ -126,11 +126,10 @@ impl<Ctx> Plunger<Ctx> {
                 debug_assert!(header.prev.is_none());
 
                 // unlink from the queue
+                queue.head = header.next;
                 if let Some(next) = header.next {
-                    queue.head = unsafe { &mut *next.as_ptr() }.next;
                     unsafe { &mut *next.as_ptr() }.prev = None;
                 } else {
-                    queue.head = None;
                     queue.tail = None;
                 }
 
