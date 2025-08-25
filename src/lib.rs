@@ -34,20 +34,61 @@ use std::{
 use pinned_aliasable::Aliasable;
 
 pub struct Plunger<Ctx = ()> {
+    // TODO: use our own Arc, with strong_count = spawners and weak_count = workers.
+    inner: Arc<Inner<Ctx>>,
+}
+
+impl<Ctx> Clone for Plunger<Ctx> {
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+        inner.queue.lock().unwrap().spawners += 1;
+        Self { inner }
+    }
+}
+
+impl<Ctx> Drop for Plunger<Ctx> {
+    fn drop(&mut self) {
+        let mut guard = self.inner.queue.lock().unwrap();
+        guard.spawners -= 1;
+        if guard.spawners == 0 {
+            self.inner.notify.notify_all();
+        }
+    }
+}
+
+struct Worker<Ctx> {
+    inner: Arc<Inner<Ctx>>,
+}
+
+impl<Ctx> Clone for Worker<Ctx> {
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+        inner.queue.lock().unwrap().workers += 1;
+        Self { inner }
+    }
+}
+
+impl<Ctx> Drop for Worker<Ctx> {
+    fn drop(&mut self) {
+        self.inner.queue.lock().unwrap().workers -= 1;
+    }
+}
+
+struct Inner<Ctx> {
     queue: Mutex<PlungerQueue<Ctx>>,
     notify: Condvar,
 }
 
-unsafe impl<Ctx> Send for Plunger<Ctx> {}
-unsafe impl<Ctx> Sync for Plunger<Ctx> {}
+unsafe impl<Ctx> Send for Inner<Ctx> {}
+unsafe impl<Ctx> Sync for Inner<Ctx> {}
 
 impl Plunger {
-    pub fn new() -> Arc<Self> {
+    pub fn new() -> Self {
         let t = std::thread::available_parallelism().unwrap_or(const { NonZero::new(4).unwrap() });
         Self::with_threads(t)
     }
 
-    pub fn with_threads(threads: NonZero<usize>) -> Arc<Self> {
+    pub fn with_threads(threads: NonZero<usize>) -> Self {
         Self::with_ctx(std::iter::repeat_n(|| {}, threads.get()))
     }
 
@@ -61,31 +102,45 @@ impl Plunger {
     }
 }
 
+impl Default for Plunger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Ctx> Plunger<Ctx> {
-    pub fn with_ctx(
-        ctx: impl IntoIterator<Item = impl FnOnce() -> Ctx + Send + 'static>,
-    ) -> Arc<Self>
+    pub fn with_ctx(ctx: impl IntoIterator<Item = impl FnOnce() -> Ctx + Send + 'static>) -> Self
     where
         Ctx: Send + 'static,
     {
-        let this = Arc::new(Self {
+        let inner = Arc::new(Inner {
             queue: Mutex::new(PlungerQueue {
                 head: None,
                 tail: None,
+                len: 0,
+                workers: 0,
+                spawners: 1,
             }),
             notify: Condvar::new(),
         });
 
+        let worker = Worker {
+            inner: inner.clone(),
+        };
+
         let mut threads = 0;
         for ctx in ctx {
             threads += 1;
-            let this = this.clone();
-            std::thread::spawn(move || this.worker(ctx));
+            let worker = worker.clone();
+            std::thread::Builder::new()
+                .name("plunger-worker".to_owned())
+                .spawn(move || worker.worker(ctx))
+                .unwrap();
         }
 
         assert!(threads > 0, "no threads spawned");
 
-        this
+        Self { inner }
     }
 
     #[inline(always)]
@@ -112,12 +167,33 @@ impl<Ctx> Plunger<Ctx> {
         }
     }
 
+    pub fn workers(&self) -> usize {
+        self.inner.queue.lock().unwrap().workers
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.queue.lock().unwrap().len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<Ctx> Worker<Ctx> {
     fn worker(&self, ctx: impl FnOnce() -> Ctx) {
         let mut ctx = ctx();
-        let mut queue = self.queue.lock().unwrap();
+
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.workers += 1;
+
         loop {
             let Some(head) = queue.head else {
-                queue = self.notify.wait(queue).unwrap();
+                if queue.spawners == 0 {
+                    break;
+                }
+
+                queue = self.inner.notify.wait(queue).unwrap();
                 continue;
             };
 
@@ -132,6 +208,7 @@ impl<Ctx> Plunger<Ctx> {
                 } else {
                     queue.tail = None;
                 }
+                queue.len -= 1;
 
                 header.state = State::Running;
 
@@ -140,7 +217,7 @@ impl<Ctx> Plunger<Ctx> {
 
             drop(queue);
             let state = unsafe { f(head.as_ptr(), &mut ctx) };
-            queue = self.queue.lock().unwrap();
+            queue = self.inner.queue.lock().unwrap();
 
             let waker = {
                 let header = unsafe { &mut *head.as_ptr() };
@@ -156,6 +233,10 @@ impl<Ctx> Plunger<Ctx> {
 struct PlungerQueue<Ctx> {
     head: Option<NonNull<PlungerTaskHeader<Ctx>>>,
     tail: Option<NonNull<PlungerTaskHeader<Ctx>>>,
+
+    len: usize,
+    workers: usize,
+    spawners: usize,
 }
 
 #[repr(C)]
@@ -272,7 +353,7 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
 
         let task = this.inner.as_ref().get();
 
-        let mut queue = plunger.queue.lock().unwrap();
+        let mut queue = plunger.inner.queue.lock().unwrap();
 
         // we can only touch the inner header while the queue is locked.
         let header = unsafe { &mut *task.footer.get() };
@@ -301,6 +382,8 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
                     queue.tail = header.prev;
                 }
 
+                queue.len -= 1;
+
                 header.state = State::Init;
 
                 // safety: state is Init, so we own this.
@@ -324,6 +407,7 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
                 } else {
                     queue.head = ptr;
                 }
+                queue.len += 1;
 
                 // mark as linked.
                 header.state = State::Queued;
@@ -361,7 +445,7 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
 
         drop(queue);
         if notify {
-            plunger.notify.notify_one();
+            plunger.inner.notify.notify_one();
         }
 
         Poll::Pending
@@ -384,20 +468,6 @@ where
     }
 }
 
-#[inline(never)]
-pub fn basic(plunger: &Plunger) -> impl Future<Output = ()> {
-    let lhs_res = String::from("lhs");
-    let fut = plunger.unblock(|| {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        lhs_res
-    });
-
-    async move {
-        let lhs_res = fut.await;
-        assert_eq!(&*lhs_res, "lhs");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -407,6 +477,7 @@ mod tests {
         time::Duration,
     };
 
+    use crossbeam_utils::sync::WaitGroup;
     use futures::{FutureExt, future::Either};
 
     use crate::Plunger;
@@ -561,5 +632,22 @@ mod tests {
 
         let first_state = block_check.await.unwrap();
         assert_eq!(*first_state.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn shutdown() {
+        let wg = WaitGroup::new();
+        let plunger = Plunger::with_ctx(
+            std::iter::from_fn(|| Some(wg.clone()))
+                .map(|wg| move || wg)
+                .take(8),
+        );
+
+        let plunger2 = plunger.clone();
+
+        drop(plunger);
+        drop(plunger2);
+
+        wg.wait();
     }
 }
