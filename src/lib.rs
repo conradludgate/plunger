@@ -29,6 +29,7 @@
 
 mod always_send_sync;
 mod block;
+mod pin_list;
 
 use core::{
     cell::UnsafeCell,
@@ -38,16 +39,18 @@ use core::{
 
 use std::{
     future::poll_fn,
-    mem::{ManuallyDrop, offset_of},
+    mem::ManuallyDrop,
     num::NonZero,
     panic::{AssertUnwindSafe, UnwindSafe},
     ptr::NonNull,
     sync::Arc,
-    task::Waker,
 };
 
+use diatomic_waker::DiatomicWaker;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use pinned_aliasable::Aliasable;
+
+use crate::pin_list::{Node, NodeData, PinList};
 
 /// `Plunger` quickly unblocks your async tasks.
 pub struct Plunger<Ctx = ()> {
@@ -96,8 +99,7 @@ impl<Ctx> Plunger<Ctx> {
     pub fn create() -> (Self, Worker<Ctx>) {
         let inner = Arc::new(Inner {
             queue: Mutex::new(PlungerQueue {
-                head: None,
-                tail: None,
+                list: PinList::new(pin_list::id::Checked::new()),
                 len: 0,
                 workers: 1,
                 shutdown: None,
@@ -203,20 +205,12 @@ impl<Ctx> Plunger<Ctx> {
         R: Send + 'static,
     {
         Task::<'_, Ctx, F, R> {
+            state: Aliasable::new(UnsafeCell::new(Value {
+                queued: ManuallyDrop::new(task),
+            })),
+            node: Node::new(),
+            job: run_once::<Ctx, F, R>,
             plunger: Some(self),
-            inner: Aliasable::new(PlungerTask {
-                shared: UnsafeCell::new(PlungerTaskShared {
-                    state: State::Init,
-                    next: None,
-                    prev: None,
-                    f: run_once::<Ctx, F, R>,
-                    waker: Waker::noop().clone(),
-                    shutdown: false,
-                }),
-                state: UnsafeCell::new(Value {
-                    queued: ManuallyDrop::new(task),
-                }),
-            }),
         }
     }
 
@@ -245,20 +239,12 @@ impl<Ctx> Plunger<Ctx> {
         R: Send + 'static,
     {
         Task::<'_, Ctx, F, R> {
+            state: Aliasable::new(UnsafeCell::new(Value {
+                queued: ManuallyDrop::new(task),
+            })),
+            node: Node::new(),
+            job: run_repeat::<Ctx, F, R>,
             plunger: Some(self),
-            inner: Aliasable::new(PlungerTask {
-                shared: UnsafeCell::new(PlungerTaskShared {
-                    state: State::Init,
-                    next: None,
-                    prev: None,
-                    f: run_repeat::<Ctx, F, R>,
-                    waker: Waker::noop().clone(),
-                    shutdown: false,
-                }),
-                state: UnsafeCell::new(Value {
-                    queued: ManuallyDrop::new(task),
-                }),
-            }),
         }
     }
 
@@ -298,7 +284,8 @@ impl<Ctx> Worker<Ctx> {
     pub fn run(self, mut ctx: Ctx) {
         let mut guard = self.inner.queue.lock();
         let shutdown = loop {
-            let Some(head) = guard.head else {
+            let mut cursor = guard.list.cursor_front_mut();
+            let Ok((job, node)) = cursor.acquire_current(false) else {
                 if let Some(shutdown) = &guard.shutdown {
                     break shutdown.clone();
                 }
@@ -307,39 +294,21 @@ impl<Ctx> Worker<Ctx> {
                 continue;
             };
 
-            let f = {
-                let (queue, shared) = unsafe { access_shared(&mut guard, head.as_ptr()) };
-                debug_assert!(shared.prev.is_none());
+            let result =
+                MutexGuard::unlocked(&mut guard, || unsafe { (job.job)(job.data, &mut ctx) });
 
-                // unlink from the queue
-                queue.head = shared.next;
-                if let Some(next) = shared.next {
-                    unsafe { access_shared(queue, next.as_ptr()) }.1.prev = None;
-                } else {
-                    queue.tail = None;
+            match result {
+                Poll::Pending => {
+                    if *node.acquired(&guard.list) {
+                        node.unprotected(&guard.list).notify();
+                    }
+                    node.insert_after(&mut guard.list.cursor_back_mut(), job);
                 }
-                queue.len -= 1;
-
-                shared.state = State::Running;
-
-                shared.f
-            };
-
-            let state = MutexGuard::unlocked(&mut guard, || unsafe { f(head.as_ptr(), &mut ctx) });
-
-            let (queue, shared) = unsafe { access_shared(&mut guard, head.as_ptr()) };
-
-            if state == State::Queued {
-                if shared.shutdown {
-                    core::mem::replace(&mut shared.waker, Waker::noop().clone()).wake();
-                    shared.state = State::Init;
-                } else {
-                    // re-link at the end of the queue.
-                    unsafe { PlungerTaskShared::link(head, queue) };
+                Poll::Ready(result) => {
+                    guard.len -= 1;
+                    node.unprotected(&guard.list).notify();
+                    node.release_current(&mut guard.list, result);
                 }
-            } else {
-                core::mem::replace(&mut shared.waker, Waker::noop().clone()).wake();
-                shared.state = state;
             }
         };
 
@@ -352,24 +321,44 @@ impl<Ctx> Worker<Ctx> {
     }
 }
 
-/// helper to ensure the shared state is tied to the lifetime of the guard.
-unsafe fn access_shared<'a, 'b, Ctx>(
-    guard: &'a mut MutexGuard<'b, PlungerQueue<Ctx>>,
-    ptr: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
-) -> (
-    &'a mut MutexGuard<'b, PlungerQueue<Ctx>>,
-    &'a mut PlungerTaskShared<Ctx>,
-) {
-    (guard, unsafe { &mut *(*ptr).get() })
-}
+// /// helper to ensure the shared state is tied to the lifetime of the guard.
+// unsafe fn access_shared<'a, 'b, Ctx>(
+//     guard: &'a mut MutexGuard<'b, PlungerQueue<Ctx>>,
+//     ptr: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
+// ) -> (
+//     &'a mut MutexGuard<'b, PlungerQueue<Ctx>>,
+//     &'a mut PlungerTaskShared<Ctx>,
+// ) {
+//     (guard, unsafe { &mut *(*ptr).get() })
+// }
 
 struct PlungerQueue<Ctx> {
-    head: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
-    tail: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
+    list: PinList<Types<Ctx>>,
 
+    // head: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
+    // tail: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
     len: usize,
     workers: usize,
     shutdown: Option<Shutdown<Ctx>>,
+}
+
+type Types<Ctx> = dyn pin_list::Types<
+        Id = pin_list::id::Checked,
+        Protected = Job<Ctx>,
+        Acquired = bool,
+        Released = JobComplete,
+        Unprotected = DiatomicWaker,
+    >;
+
+enum JobComplete {
+    Success,
+    Panic,
+}
+
+// todo: how can we store a `&mut dyn FnMut(&mut Ctx) -> Poll<()>` inside of pin_list :think:
+struct Job<Ctx> {
+    job: unsafe fn(inout: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>,
+    data: *mut (),
 }
 
 enum Shutdown<Ctx> {
@@ -386,72 +375,72 @@ impl<Ctx> Clone for Shutdown<Ctx> {
     }
 }
 
-#[repr(C)]
-struct PlungerTask<Ctx, F, R> {
-    // if shared.state == Init, Completed, or Panicked, then this is owned by the Task.
-    // if shared.state == Queued, or Running, then this is owned by one of the worker threads.
-    state: UnsafeCell<Value<F, R>>,
+// #[repr(C)]
+// struct PlungerTask<Ctx, F, R> {
+//     // if shared.state == Init, Completed, or Panicked, then this is owned by the Task.
+//     // if shared.state == Queued, or Running, then this is owned by one of the worker threads.
+//     state: UnsafeCell<Value<F, R>>,
 
-    // can only be read/mutated while holding the queue lock.
-    shared: UnsafeCell<PlungerTaskShared<Ctx>>,
-}
+//     // can only be read/mutated while holding the queue lock.
+//     shared: UnsafeCell<PlungerTaskShared<Ctx>>,
+// }
 
-struct PlungerTaskShared<Ctx> {
-    state: State,
+// struct PlungerTaskShared<Ctx> {
+//     state: State,
 
-    // next/prev are only used if state == Queued.
-    next: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
-    prev: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
+//     // next/prev are only used if state == Queued.
+//     next: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
+//     prev: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
 
-    shutdown: bool,
-    waker: Waker,
+//     shutdown: bool,
+//     waker: Waker,
 
-    f: unsafe fn(inout: *mut UnsafeCell<PlungerTaskShared<Ctx>>, ctx: &mut Ctx) -> State,
-}
+//     f: unsafe fn(inout: *mut UnsafeCell<PlungerTaskShared<Ctx>>, ctx: &mut Ctx) -> State,
+// }
 
-impl<Ctx> PlungerTaskShared<Ctx> {
-    unsafe fn link(ptr: NonNull<UnsafeCell<Self>>, queue: &mut MutexGuard<'_, PlungerQueue<Ctx>>) {
-        let (queue, shared) = unsafe { access_shared(queue, ptr.as_ptr()) };
+// impl<Ctx> PlungerTaskShared<Ctx> {
+//     unsafe fn link(ptr: NonNull<UnsafeCell<Self>>, queue: &mut MutexGuard<'_, PlungerQueue<Ctx>>) {
+//         let (queue, shared) = unsafe { access_shared(queue, ptr.as_ptr()) };
 
-        // link into the queue
-        shared.prev = queue.tail.replace(ptr);
-        if let Some(prev) = shared.prev {
-            unsafe { access_shared(queue, prev.as_ptr()) }.1.next = Some(ptr);
-        } else {
-            queue.head = Some(ptr);
-        }
-        queue.len += 1;
+//         // link into the queue
+//         shared.prev = queue.tail.replace(ptr);
+//         if let Some(prev) = shared.prev {
+//             unsafe { access_shared(queue, prev.as_ptr()) }.1.next = Some(ptr);
+//         } else {
+//             queue.head = Some(ptr);
+//         }
+//         queue.len += 1;
 
-        // mark as linked.
-        shared.state = State::Queued;
-    }
+//         // mark as linked.
+//         shared.state = State::Queued;
+//     }
 
-    unsafe fn unlink(&mut self, queue: &mut MutexGuard<'_, PlungerQueue<Ctx>>) {
-        // unlink from the queue
-        if let Some(prev) = self.prev {
-            unsafe { access_shared(queue, prev.as_ptr()) }.1.next = self.next;
-        } else {
-            queue.head = self.next;
-        }
+//     unsafe fn unlink(&mut self, queue: &mut MutexGuard<'_, PlungerQueue<Ctx>>) {
+//         // unlink from the queue
+//         if let Some(prev) = self.prev {
+//             unsafe { access_shared(queue, prev.as_ptr()) }.1.next = self.next;
+//         } else {
+//             queue.head = self.next;
+//         }
 
-        if let Some(next) = self.next {
-            unsafe { access_shared(queue, next.as_ptr()) }.1.prev = self.prev;
-        } else {
-            queue.tail = self.prev;
-        }
+//         if let Some(next) = self.next {
+//             unsafe { access_shared(queue, next.as_ptr()) }.1.prev = self.prev;
+//         } else {
+//             queue.tail = self.prev;
+//         }
 
-        queue.len -= 1;
-    }
-}
+//         queue.len -= 1;
+//     }
+// }
 
-#[derive(PartialEq, Debug, Clone, Copy)]
-enum State {
-    Init,
-    Queued,
-    Running,
-    Completed,
-    Panicked,
-}
+// #[derive(PartialEq, Debug, Clone, Copy)]
+// enum State {
+//     Init,
+//     Queued,
+//     Running,
+//     Completed,
+//     Panicked,
+// }
 
 union Value<F, R> {
     queued: ManuallyDrop<F>,
@@ -462,16 +451,8 @@ union Value<F, R> {
 /// # Safety:
 /// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
 /// `task.shared.state` must be `Running`
-unsafe fn task_state<'a, Ctx, F, R>(
-    shared: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
-) -> &'a mut Value<F, R> {
-    let offset = const {
-        offset_of!(PlungerTask<Ctx, F, R>, state) as isize
-            - offset_of!(PlungerTask<Ctx, F, R>, shared) as isize
-    };
-
-    // safety: caller ensures this is a valid PlungerTask
-    let task_state = unsafe { shared.byte_offset(offset).cast::<UnsafeCell<Value<F, R>>>() };
+unsafe fn task_state<'a, F, R>(task_state: *mut ()) -> &'a mut Value<F, R> {
+    let task_state = task_state.cast::<UnsafeCell<Value<F, R>>>();
 
     // safety: caller ensures that state is Running, so we own this.
     unsafe { &mut *(*task_state).get() }
@@ -480,26 +461,23 @@ unsafe fn task_state<'a, Ctx, F, R>(
 /// # Safety:
 /// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
 /// `task.shared.state` must be `Running`
-unsafe fn run_once<Ctx, F, R>(
-    shared: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
-    ctx: &mut Ctx,
-) -> State
+unsafe fn run_once<Ctx, F, R>(state: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>
 where
     F: FnOnce(&mut Ctx) -> R + 'static,
     Ctx: UnwindSafe,
 {
     // safety: caller ensures that state is Running, so we own this.
-    let task_state = unsafe { task_state::<Ctx, F, R>(shared) };
+    let task_state = unsafe { task_state::<F, R>(state) };
 
     let func = unsafe { ManuallyDrop::take(&mut task_state.queued) };
     match std::panic::catch_unwind(AssertUnwindSafe(|| func(ctx))) {
         Ok(output) => {
             task_state.completed = ManuallyDrop::new(output);
-            State::Completed
+            Poll::Ready(JobComplete::Success)
         }
         Err(panic) => {
             task_state.panicked = ManuallyDrop::new(panic);
-            State::Panicked
+            Poll::Ready(JobComplete::Panic)
         }
     }
 }
@@ -507,29 +485,26 @@ where
 /// # Safety:
 /// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
 /// `task.shared.state` must be `Running`
-unsafe fn run_repeat<Ctx, F, R>(
-    shared: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
-    ctx: &mut Ctx,
-) -> State
+unsafe fn run_repeat<Ctx, F, R>(state: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>
 where
     F: FnMut(&mut Ctx) -> Poll<R> + 'static,
     Ctx: UnwindSafe,
 {
     // safety: caller ensures that state is Running, so we own this.
-    let task_state = unsafe { task_state::<Ctx, F, R>(shared) };
+    let task_state = unsafe { task_state::<F, R>(state) };
 
     let func = unsafe { &mut task_state.queued };
     match std::panic::catch_unwind(AssertUnwindSafe(|| func(ctx))) {
-        Ok(Poll::Pending) => State::Queued,
+        Ok(Poll::Pending) => Poll::Pending,
         Ok(Poll::Ready(output)) => {
             unsafe { ManuallyDrop::drop(&mut task_state.queued) };
             task_state.completed = ManuallyDrop::new(output);
-            State::Completed
+            Poll::Ready(JobComplete::Success)
         }
         Err(panic) => {
             unsafe { ManuallyDrop::drop(&mut task_state.queued) };
             task_state.panicked = ManuallyDrop::new(panic);
-            State::Panicked
+            Poll::Ready(JobComplete::Panic)
         }
     }
 }
@@ -537,7 +512,12 @@ where
 pin_project_lite::pin_project!(
     struct Task<'a, Ctx, F, R> {
         #[pin]
-        inner: Aliasable<PlungerTask<Ctx, F, R>>,
+        state: Aliasable<UnsafeCell<Value<F, R>>>,
+
+        #[pin]
+        node: Node<Types<Ctx>>,
+
+        job: unsafe fn(inout: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>,
 
         plunger: Option<&'a Plunger<Ctx>>,
     }
@@ -562,88 +542,99 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
         cx: &mut Context<'_>,
         unlink: bool,
     ) -> Poll<std::thread::Result<Option<R>>> {
-        let this = self.project();
+        let mut this = self.project();
         let Some(plunger) = *this.plunger else {
             panic!("polled after completion");
         };
 
-        let task = this.inner.as_ref().get();
-
-        let mut guard = plunger.inner.queue.lock();
-
-        // we can only touch the inner shared while the queue is locked.
-        let (queue, shared) =
-            unsafe { access_shared(&mut guard, std::ptr::from_ref(&task.shared).cast_mut()) };
-
-        let notify = match shared.state {
-            State::Init | State::Queued if unlink => {
-                if shared.state == State::Queued {
-                    // unlink from the queue
-                    unsafe {
-                        shared.unlink(queue);
-                    }
-                    shared.state = State::Init;
-                }
-
+        let node = match this.node.as_mut().initialized_mut() {
+            Some(node) => node,
+            None if unlink => {
                 // safety: state is Init, so we own this.
-                let task_state = unsafe { &mut *task.state.get() };
+                let task_state = unsafe { &mut *this.state.as_ref().get().get() };
                 unsafe { ManuallyDrop::drop(&mut task_state.queued) };
 
                 *this.plunger = None;
                 return Poll::Ready(Ok(None));
             }
-            // we need to enqueue ourselves.
-            State::Init => {
-                shared.waker.clone_from(cx.waker());
-
+            None => {
                 // get our shared pointer
                 // this is a bit awkward to preserve the borrow stack.
-                let ptr = unsafe {
-                    NonNull::from(task)
-                        .byte_add(const { offset_of!(PlungerTask<Ctx, F, R>, shared) })
-                        .cast()
+                let data = NonNull::from(this.state.as_ref().get()).as_ptr().cast();
+
+                let job = Job {
+                    job: *this.job,
+                    data,
                 };
 
-                unsafe { PlungerTaskShared::link(ptr, queue) };
+                let mut guard = plunger.inner.queue.lock();
+                guard.len += 1;
+                let node = guard.list.push_back(this.node, job, DiatomicWaker::new());
 
-                // notify that a task is now ready.
-                true
-            }
-            // keep waiting.
-            State::Queued | State::Running => {
-                shared.shutdown = unlink;
-                shared.waker.clone_from(cx.waker());
+                unsafe { node.unprotected().register(cx.waker()) };
+                drop(guard);
 
-                // do not notify about a new task.
-                false
-            }
-            // get the value
-            State::Completed => {
-                // safety: state is Completed, so we own this.
-                let task_state = unsafe { &mut *task.state.get() };
-                // safety: state is Completed.
-                let output = unsafe { ManuallyDrop::take(&mut task_state.completed) };
+                plunger.inner.notify.notify_one();
 
-                *this.plunger = None;
-                return Poll::Ready(Ok(Some(output)));
-            }
-            State::Panicked => {
-                // safety: state is Panicked, so we own this.
-                let task_state = unsafe { &mut *task.state.get() };
-                // safety: state is Panicked.
-                let output = unsafe { ManuallyDrop::take(&mut task_state.panicked) };
-
-                *this.plunger = None;
-                return Poll::Ready(Err(output));
+                return Poll::Pending;
             }
         };
 
-        drop(guard);
-        if notify {
-            plunger.inner.notify.notify_one();
-        }
+        let mut guard = plunger.inner.queue.lock();
 
-        Poll::Pending
+        let (completion, _) = if unlink {
+            match node.reset(&mut guard.list) {
+                // currently running, cannot be removed
+                Err(node) => {
+                    // register our intent to cancel.
+                    *node.acquired_mut(&mut guard.list).unwrap() = true;
+                    unsafe { node.unprotected().register(cx.waker()) };
+                    return Poll::Pending;
+                }
+                // was in the queue
+                Ok((NodeData::Linked(_), _)) => {
+                    drop(guard);
+
+                    // safety: no longer shared
+                    let task_state = unsafe { &mut *this.state.as_ref().get().get() };
+
+                    // safety: we were linked in the queue, so the queued value must be initialised
+                    unsafe { ManuallyDrop::drop(&mut task_state.queued) };
+
+                    *this.plunger = None;
+                    return Poll::Ready(Ok(None));
+                }
+                // had finished already
+                Ok((NodeData::Released(completion), waker)) => (completion, waker),
+            }
+        } else if node.protected(&guard.list).is_some() || node.acquired(&guard.list).is_some() {
+            unsafe { node.unprotected().register(cx.waker()) };
+            drop(guard);
+
+            return Poll::Pending;
+        } else {
+            unsafe { node.take_removed_unchecked() }
+        };
+
+        drop(guard);
+
+        // safety: no longer shared
+        let task_state = unsafe { &mut *this.state.as_ref().get().get() };
+
+        match completion {
+            JobComplete::Success => {
+                let output = unsafe { ManuallyDrop::take(&mut task_state.completed) };
+
+                *this.plunger = None;
+                Poll::Ready(Ok(Some(output)))
+            }
+            JobComplete::Panic => {
+                let output = unsafe { ManuallyDrop::take(&mut task_state.panicked) };
+
+                *this.plunger = None;
+                Poll::Ready(Err(output))
+            }
+        }
     }
 }
 

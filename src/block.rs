@@ -56,9 +56,13 @@ impl Signal {
                 *state = SignalState::Waiting;
 
                 block_in_place(|| {
-                    self.cond
-                        .wait_while(&mut state, |s| matches!(*s, SignalState::Waiting))
-                })
+                    println!("blocking");
+                    self.cond.wait_while(&mut state, |s| {
+                        println!("checking");
+                        matches!(*s, SignalState::Waiting)
+                    });
+                    println!("unblocked");
+                });
             }
         }
     }
