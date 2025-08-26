@@ -27,6 +27,8 @@
 //! 2. Tasks run in the range of 100us to 1ms
 //! 3. We can use block_in_place to reduce the impact of blocking when the tokio feature is enabled and using a multithreaded runtime.
 
+mod block;
+
 use core::{
     cell::UnsafeCell,
     pin::Pin,
@@ -332,17 +334,7 @@ pin_project_lite::pin_project!(
     impl<Ctx, F, R> PinnedDrop for Task<'_, Ctx, F, R> {
         fn drop(mut this: Pin<&mut Self>) {
             while this.plunger.is_some() {
-                let fut = poll_fn(|cx| this.as_mut().poll_inner(cx, true));
-
-                #[cfg(feature = "tokio")]
-                if let Ok(handle) = tokio::runtime::Handle::try_current()
-                    && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-                {
-                    let _ = tokio::task::block_in_place(|| pollster::block_on(fut));
-                    continue;
-                }
-
-                let _ = pollster::block_on(fut);
+                let _ = block::block_on(poll_fn(|cx| this.as_mut().poll_inner(cx, true)));
             }
         }
     }
