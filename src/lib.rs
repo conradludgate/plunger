@@ -27,6 +27,7 @@
 //! 2. Tasks run in the range of 100us to 1ms
 //! 3. We can use block_in_place to reduce the impact of blocking when the tokio feature is enabled and using a multithreaded runtime.
 
+mod always_send_sync;
 mod block;
 
 use core::{
@@ -48,24 +49,17 @@ use std::{
 use parking_lot::{Condvar, Mutex};
 use pinned_aliasable::Aliasable;
 
+/// `Plunger` quickly unblocks your async tasks.
 pub struct Plunger<Ctx = ()> {
     // TODO: use our own Arc, with strong_count = spawners and weak_count = workers.
     inner: Arc<Inner<Ctx>>,
 }
 
-impl<Ctx> Clone for Plunger<Ctx> {
-    fn clone(&self) -> Self {
-        let inner = self.inner.clone();
-        inner.queue.lock().spawners += 1;
-        Self { inner }
-    }
-}
-
 impl<Ctx> Drop for Plunger<Ctx> {
     fn drop(&mut self) {
         let mut guard = self.inner.queue.lock();
-        guard.spawners -= 1;
-        if guard.spawners == 0 {
+        if guard.shutdown.is_none() {
+            guard.shutdown = Some(Shutdown::Drop);
             self.inner.notify.notify_all();
         }
     }
@@ -98,22 +92,15 @@ unsafe impl<Ctx> Send for Inner<Ctx> {}
 unsafe impl<Ctx> Sync for Inner<Ctx> {}
 
 impl Plunger {
+    /// Create a new `Plunger` with the number of threads tuned according to the [`std::thread::available_parallelism`].
     pub fn new() -> Self {
         let t = std::thread::available_parallelism().unwrap_or(const { NonZero::new(4).unwrap() });
         Self::with_threads(t)
     }
 
+    /// Create a new `Plunger` with the given number of threads.
     pub fn with_threads(threads: NonZero<usize>) -> Self {
         Self::with_ctx(std::iter::repeat_n(|| {}, threads.get()))
-    }
-
-    #[inline(always)]
-    pub fn unblock<F, R>(&self, task: F) -> impl Future<Output = R>
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        self.unblock_ctx(|&mut ()| task())
     }
 }
 
@@ -124,6 +111,13 @@ impl Default for Plunger {
 }
 
 impl<Ctx> Plunger<Ctx> {
+    /// Create a new `Plunger`, using the iterator to define the threads.
+    ///
+    /// ## Context
+    ///
+    /// Worker threads can have a thread local context that can be used for some arbitrary purpose by
+    /// the tasks spawned into the worker. This could be just a scratch space, or it could be a cache,
+    /// or it could be some metrics. The world is your oyster.
     pub fn with_ctx(ctx: impl IntoIterator<Item = impl FnOnce() -> Ctx + Send + 'static>) -> Self
     where
         Ctx: Send + 'static,
@@ -134,7 +128,7 @@ impl<Ctx> Plunger<Ctx> {
                 tail: None,
                 len: 0,
                 workers: 0,
-                spawners: 1,
+                shutdown: None,
             }),
             notify: Condvar::new(),
         });
@@ -158,6 +152,65 @@ impl<Ctx> Plunger<Ctx> {
         Self { inner }
     }
 
+    /// Steal the contexts from the workers in an arbitrary order and shutdown the thread pool.
+    pub fn steal_contexts(self) -> Vec<Ctx>
+    where
+        Ctx: Send,
+    {
+        let mut queue = self.inner.queue.lock();
+
+        let w = queue.workers;
+        let (tx, rx) = std::sync::mpsc::sync_channel(w);
+
+        queue.shutdown = Some(Shutdown::Steal(always_send_sync::AlwaysSendSync::new(tx)));
+        self.inner.notify.notify_all();
+
+        drop(queue);
+        drop(self);
+
+        let mut ctx = Vec::with_capacity(w);
+        ctx.extend(rx.iter());
+        ctx
+    }
+
+    /// Run the CPU intensive code in the thread pool, avoiding blocking the async runtime.
+    ///
+    /// ## Cancellation
+    ///
+    /// If this task is cancelled before completion, it might block the runtime.
+    /// This is because we allocate the task in the current stack, and not on the heap,
+    /// so we need to keep the stack allocation initialised and wait until it is free.
+    ///
+    /// We use [`tokio::task::block_in_place`] if available. If the task is only in the queue,
+    /// no blocking will occur.
+    ///
+    /// For this reason, we recommend that you ensure cancellation is rare,
+    /// and that tasks run for 100us-1ms to reduce the blocking duration.
+    #[inline(always)]
+    pub fn unblock<F, R>(&self, task: F) -> impl Future<Output = R>
+    where
+        Ctx: UnwindSafe,
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.unblock_ctx(|&mut _| task())
+    }
+
+    /// Run the CPU intensive code in the thread pool, avoiding blocking the async runtime.
+    ///
+    /// This additionally grants access to the thread local context. Use it as you wish.
+    ///
+    /// ## Cancellation
+    ///
+    /// If this task is cancelled before completion, it might block the runtime.
+    /// This is because we allocate the task in the current stack, and not on the heap,
+    /// so we need to keep the stack allocation initialised and wait until it is free.
+    ///
+    /// We use [`tokio::task::block_in_place`] if available. If the task is only in the queue,
+    /// no blocking will occur.
+    ///
+    /// For this reason, we recommend that you ensure cancellation is rare,
+    /// and that tasks run for 100us-1ms to reduce the blocking duration.
     #[inline(always)]
     pub fn unblock_ctx<F, R>(&self, task: F) -> impl Future<Output = R>
     where
@@ -196,16 +249,16 @@ impl<Ctx> Plunger<Ctx> {
 }
 
 impl<Ctx> Worker<Ctx> {
-    fn worker(&self, ctx: impl FnOnce() -> Ctx) {
+    fn worker(self, ctx: impl FnOnce() -> Ctx) {
         let mut ctx = ctx();
 
         let mut queue = self.inner.queue.lock();
         queue.workers += 1;
 
-        loop {
+        let shutdown = loop {
             let Some(head) = queue.head else {
-                if queue.spawners == 0 {
-                    break;
+                if let Some(shutdown) = &queue.shutdown {
+                    break shutdown.clone();
                 }
 
                 self.inner.notify.wait(&mut queue);
@@ -241,6 +294,13 @@ impl<Ctx> Worker<Ctx> {
             };
 
             waker.wake();
+        };
+
+        drop(queue);
+        drop(self);
+
+        if let Shutdown::Steal(tx) = shutdown {
+            _ = tx.inner.send(ctx);
         }
     }
 }
@@ -251,7 +311,21 @@ struct PlungerQueue<Ctx> {
 
     len: usize,
     workers: usize,
-    spawners: usize,
+    shutdown: Option<Shutdown<Ctx>>,
+}
+
+enum Shutdown<Ctx> {
+    Drop,
+    Steal(always_send_sync::AlwaysSendSync<std::sync::mpsc::SyncSender<Ctx>>),
+}
+
+impl<Ctx> Clone for Shutdown<Ctx> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Drop => Self::Drop,
+            Self::Steal(tx) => Self::Steal(tx.clone()),
+        }
+    }
 }
 
 #[repr(C)]
@@ -553,7 +627,7 @@ mod tests {
 
         // proper run
 
-        let plunger = Plunger::with_threads(NonZero::new(4).unwrap());
+        let plunger = Arc::new(Plunger::with_threads(NonZero::new(4).unwrap()));
 
         let start = Instant::now();
         let mut join_set = JoinSet::new();
@@ -716,11 +790,17 @@ mod tests {
                 .take(8),
         );
 
-        let plunger2 = plunger.clone();
-
         drop(plunger);
-        drop(plunger2);
 
         wg.wait();
+    }
+
+    #[test]
+    fn take_context() {
+        let plunger = Plunger::with_ctx([|| 1, || 2, || 3, || 4, || 5, || 6, || 7, || 8]);
+        let mut ctx = plunger.steal_contexts();
+
+        ctx.sort_unstable();
+        assert_eq!(ctx, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }

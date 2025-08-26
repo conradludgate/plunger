@@ -9,7 +9,7 @@ categories = ["asynchronous"]
 keywords = ["async", "non-blocking", "futures"]
 
 [features]
-default = []
+default = ["tokio"]
 tokio = ["dep:tokio"]
 
 [dependencies]
