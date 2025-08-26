@@ -1,19 +1,31 @@
 //! [`Plunger`] quickly unblocks your async tasks.
 //!
+//! ## Example
+//!
 //! ```
 //! #[tokio::main]
 //! async fn main() {
 //!     let plunger = plunger::Plunger::new();
 //!
-//!     let password = "hunter2".to_owned();
-//!     let _hash: [u8; 32] = plunger.unblock(move || password_hash(&password)).await;
-//! }
+//!     let hash = "$argon2i$v=19$m=65536,t=1,p=1$c29tZXNhbHQAAAAAAAAAAA$+r0d29hqEB0yasKr55ZgICsQGSkl0v0kgwhd+U3wyRo";
+//!     let password = "password";
 //!
-//! fn password_hash(_pw: &str) -> [u8; 32] {
-//!     /* some CPU intensive password hash. */
-//! #    [0; 32]
+//!     plunger
+//!         .unblock(move || password_auth::verify_password(password, hash))
+//!         .await
+//!         .unwrap();
 //! }
 //! ```
+//!
+//! ## Important notes
+//!
+//! While the intent is to unblock the async runtime, this API might have to defensively block the runtime if
+//! cancellation occurs while the task is running.
+//!
+//! We assume the following:
+//! 1. Cancellation is rare
+//! 2. Tasks run in the range of 100us to 1ms
+//! 3. We can use block_in_place to reduce the impact of blocking when the tokio feature is enabled and using a multithreaded runtime.
 
 use core::{
     cell::UnsafeCell,
@@ -27,10 +39,11 @@ use std::{
     num::NonZero,
     panic::{AssertUnwindSafe, UnwindSafe},
     ptr::NonNull,
-    sync::{Arc, Condvar, Mutex},
+    sync::Arc,
     task::Waker,
 };
 
+use parking_lot::{Condvar, Mutex};
 use pinned_aliasable::Aliasable;
 
 pub struct Plunger<Ctx = ()> {
@@ -41,14 +54,14 @@ pub struct Plunger<Ctx = ()> {
 impl<Ctx> Clone for Plunger<Ctx> {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
-        inner.queue.lock().unwrap().spawners += 1;
+        inner.queue.lock().spawners += 1;
         Self { inner }
     }
 }
 
 impl<Ctx> Drop for Plunger<Ctx> {
     fn drop(&mut self) {
-        let mut guard = self.inner.queue.lock().unwrap();
+        let mut guard = self.inner.queue.lock();
         guard.spawners -= 1;
         if guard.spawners == 0 {
             self.inner.notify.notify_all();
@@ -63,14 +76,14 @@ struct Worker<Ctx> {
 impl<Ctx> Clone for Worker<Ctx> {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
-        inner.queue.lock().unwrap().workers += 1;
+        inner.queue.lock().workers += 1;
         Self { inner }
     }
 }
 
 impl<Ctx> Drop for Worker<Ctx> {
     fn drop(&mut self) {
-        self.inner.queue.lock().unwrap().workers -= 1;
+        self.inner.queue.lock().workers -= 1;
     }
 }
 
@@ -168,11 +181,11 @@ impl<Ctx> Plunger<Ctx> {
     }
 
     pub fn workers(&self) -> usize {
-        self.inner.queue.lock().unwrap().workers
+        self.inner.queue.lock().workers
     }
 
     pub fn len(&self) -> usize {
-        self.inner.queue.lock().unwrap().len
+        self.inner.queue.lock().len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -184,7 +197,7 @@ impl<Ctx> Worker<Ctx> {
     fn worker(&self, ctx: impl FnOnce() -> Ctx) {
         let mut ctx = ctx();
 
-        let mut queue = self.inner.queue.lock().unwrap();
+        let mut queue = self.inner.queue.lock();
         queue.workers += 1;
 
         loop {
@@ -193,7 +206,7 @@ impl<Ctx> Worker<Ctx> {
                     break;
                 }
 
-                queue = self.inner.notify.wait(queue).unwrap();
+                self.inner.notify.wait(&mut queue);
                 continue;
             };
 
@@ -217,7 +230,7 @@ impl<Ctx> Worker<Ctx> {
 
             drop(queue);
             let state = unsafe { f(head.as_ptr(), &mut ctx) };
-            queue = self.inner.queue.lock().unwrap();
+            queue = self.inner.queue.lock();
 
             let waker = {
                 let header = unsafe { &mut *head.as_ptr() };
@@ -353,7 +366,7 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
 
         let task = this.inner.as_ref().get();
 
-        let mut queue = plunger.inner.queue.lock().unwrap();
+        let mut queue = plunger.inner.queue.lock();
 
         // we can only touch the inner header while the queue is locked.
         let header = unsafe { &mut *task.footer.get() };
@@ -471,14 +484,17 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        hint::black_box,
         num::NonZero,
         pin::pin,
         sync::{Arc, Mutex},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use crossbeam_utils::sync::WaitGroup;
     use futures::{FutureExt, future::Either};
+    use pbkdf2::pbkdf2_hmac_array;
+    use tokio::task::JoinSet;
 
     use crate::Plunger;
 
@@ -507,6 +523,71 @@ mod tests {
 
         assert_eq!(&*lhs_res, "lhs");
         assert_eq!(&*rhs_res, "rhs");
+    }
+
+    #[ignore = "slow"]
+    #[tokio::test]
+    async fn smoke() {
+        const N: u32 = 1000;
+        const M: u32 = 1000;
+
+        // warmup 0
+
+        for _ in 0..M {
+            black_box(pbkdf2_hmac_array::<sha2::Sha256, 32>(
+                black_box(b"hunter2"),
+                black_box(b"mysupersecuresalt"),
+                400,
+            ));
+        }
+
+        // warmup 1
+
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..M {
+                        black_box(pbkdf2_hmac_array::<sha2::Sha256, 32>(
+                            black_box(b"hunter2"),
+                            black_box(b"mysupersecuresalt"),
+                            400,
+                        ));
+                    }
+                });
+            }
+        });
+        let expected_dur = start.elapsed() / M / 4;
+
+        // proper run
+
+        let plunger = Plunger::with_threads(NonZero::new(4).unwrap());
+
+        let start = Instant::now();
+        let mut join_set = JoinSet::new();
+        for _ in 0..N {
+            let plunger = plunger.clone();
+            join_set.spawn(async move {
+                for _ in 0..M {
+                    let res = plunger
+                        .unblock(move || {
+                            pbkdf2_hmac_array::<sha2::Sha256, 32>(
+                                black_box(b"hunter2"),
+                                black_box(b"mysupersecuresalt"),
+                                400,
+                            )
+                        })
+                        .await;
+
+                    black_box(res);
+                }
+            });
+        }
+        join_set.join_all().await;
+
+        let dur = start.elapsed() / N / M;
+
+        dbg!(dur, expected_dur);
     }
 
     #[tokio::test]
