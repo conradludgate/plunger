@@ -87,20 +87,8 @@ impl Wake for Signal {
     fn wake(self: Arc<Self>) {
         self.notify();
     }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.notify();
-    }
 }
 
-/// Block the thread until the future is ready.
-///
-/// # Example
-///
-/// ```
-/// let my_fut = async {};
-/// let result = pollster::block_on(my_fut);
-/// ```
 pub fn block_on<F: IntoFuture>(fut: F) -> F::Output {
     let mut fut = core::pin::pin!(fut.into_future());
 

@@ -65,24 +65,6 @@ impl<Ctx> Drop for Plunger<Ctx> {
     }
 }
 
-struct Worker<Ctx> {
-    inner: Arc<Inner<Ctx>>,
-}
-
-impl<Ctx> Clone for Worker<Ctx> {
-    fn clone(&self) -> Self {
-        let inner = self.inner.clone();
-        inner.queue.lock().workers += 1;
-        Self { inner }
-    }
-}
-
-impl<Ctx> Drop for Worker<Ctx> {
-    fn drop(&mut self) {
-        self.inner.queue.lock().workers -= 1;
-    }
-}
-
 struct Inner<Ctx> {
     queue: Mutex<PlungerQueue<Ctx>>,
     notify: Condvar,
@@ -111,6 +93,25 @@ impl Default for Plunger {
 }
 
 impl<Ctx> Plunger<Ctx> {
+    pub fn create() -> (Self, Worker<Ctx>) {
+        let inner = Arc::new(Inner {
+            queue: Mutex::new(PlungerQueue {
+                head: None,
+                tail: None,
+                len: 0,
+                workers: 1,
+                shutdown: None,
+            }),
+            notify: Condvar::new(),
+        });
+
+        let worker = Worker {
+            inner: inner.clone(),
+        };
+
+        (Self { inner }, worker)
+    }
+
     /// Create a new `Plunger`, using the iterator to define the threads.
     ///
     /// ## Context
@@ -122,34 +123,17 @@ impl<Ctx> Plunger<Ctx> {
     where
         Ctx: Send + 'static,
     {
-        let inner = Arc::new(Inner {
-            queue: Mutex::new(PlungerQueue {
-                head: None,
-                tail: None,
-                len: 0,
-                workers: 0,
-                shutdown: None,
-            }),
-            notify: Condvar::new(),
-        });
+        let (this, worker) = Self::create();
 
-        let worker = Worker {
-            inner: inner.clone(),
-        };
-
-        let mut threads = 0;
         for ctx in ctx {
-            threads += 1;
             let worker = worker.clone();
             std::thread::Builder::new()
                 .name("plunger-worker".to_owned())
-                .spawn(move || worker.worker(ctx))
+                .spawn(move || worker.run(ctx()))
                 .unwrap();
         }
 
-        assert!(threads > 0, "no threads spawned");
-
-        Self { inner }
+        this
     }
 
     /// Steal the contexts from the workers in an arbitrary order and shutdown the thread pool.
@@ -291,10 +275,27 @@ impl<Ctx> Plunger<Ctx> {
     }
 }
 
-impl<Ctx> Worker<Ctx> {
-    fn worker(self, ctx: impl FnOnce() -> Ctx) {
-        let mut ctx = ctx();
+pub struct Worker<Ctx> {
+    inner: Arc<Inner<Ctx>>,
+}
 
+impl<Ctx> Clone for Worker<Ctx> {
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+        inner.queue.lock().workers += 1;
+        Self { inner }
+    }
+}
+
+impl<Ctx> Drop for Worker<Ctx> {
+    fn drop(&mut self) {
+        self.inner.queue.lock().workers -= 1;
+    }
+}
+
+impl<Ctx> Worker<Ctx> {
+    /// Run a worker thread.
+    pub fn run(self, mut ctx: Ctx) {
         let mut guard = self.inner.queue.lock();
         let shutdown = loop {
             let Some(head) = guard.head else {
@@ -334,16 +335,7 @@ impl<Ctx> Worker<Ctx> {
                     shared.state = State::Init;
                 } else {
                     // re-link at the end of the queue.
-                    let ptr = Some(head);
-                    shared.prev = core::mem::replace(&mut queue.tail, ptr);
-                    if let Some(prev) = shared.prev {
-                        unsafe { access_shared(queue, prev.as_ptr()) }.1.next = None;
-                    } else {
-                        queue.head = ptr;
-                    }
-
-                    queue.len += 1;
-                    shared.state = State::Queued;
+                    unsafe { PlungerTaskShared::link(head, queue) };
                 }
             } else {
                 core::mem::replace(&mut shared.waker, Waker::noop().clone()).wake();
@@ -363,17 +355,17 @@ impl<Ctx> Worker<Ctx> {
 /// helper to ensure the shared state is tied to the lifetime of the guard.
 unsafe fn access_shared<'a, 'b, Ctx>(
     guard: &'a mut MutexGuard<'b, PlungerQueue<Ctx>>,
-    ptr: *mut PlungerTaskShared<Ctx>,
+    ptr: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
 ) -> (
     &'a mut MutexGuard<'b, PlungerQueue<Ctx>>,
     &'a mut PlungerTaskShared<Ctx>,
 ) {
-    (guard, unsafe { &mut *ptr })
+    (guard, unsafe { &mut *(*ptr).get() })
 }
 
 struct PlungerQueue<Ctx> {
-    head: Option<NonNull<PlungerTaskShared<Ctx>>>,
-    tail: Option<NonNull<PlungerTaskShared<Ctx>>>,
+    head: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
+    tail: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
 
     len: usize,
     workers: usize,
@@ -408,13 +400,48 @@ struct PlungerTaskShared<Ctx> {
     state: State,
 
     // next/prev are only used if state == Queued.
-    next: Option<NonNull<PlungerTaskShared<Ctx>>>,
-    prev: Option<NonNull<PlungerTaskShared<Ctx>>>,
+    next: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
+    prev: Option<NonNull<UnsafeCell<PlungerTaskShared<Ctx>>>>,
 
     shutdown: bool,
     waker: Waker,
 
-    f: unsafe fn(inout: *mut PlungerTaskShared<Ctx>, ctx: &mut Ctx) -> State,
+    f: unsafe fn(inout: *mut UnsafeCell<PlungerTaskShared<Ctx>>, ctx: &mut Ctx) -> State,
+}
+
+impl<Ctx> PlungerTaskShared<Ctx> {
+    unsafe fn link(ptr: NonNull<UnsafeCell<Self>>, queue: &mut MutexGuard<'_, PlungerQueue<Ctx>>) {
+        let (queue, shared) = unsafe { access_shared(queue, ptr.as_ptr()) };
+
+        // link into the queue
+        shared.prev = queue.tail.replace(ptr);
+        if let Some(prev) = shared.prev {
+            unsafe { access_shared(queue, prev.as_ptr()) }.1.next = Some(ptr);
+        } else {
+            queue.head = Some(ptr);
+        }
+        queue.len += 1;
+
+        // mark as linked.
+        shared.state = State::Queued;
+    }
+
+    unsafe fn unlink(&mut self, queue: &mut MutexGuard<'_, PlungerQueue<Ctx>>) {
+        // unlink from the queue
+        if let Some(prev) = self.prev {
+            unsafe { access_shared(queue, prev.as_ptr()) }.1.next = self.next;
+        } else {
+            queue.head = self.next;
+        }
+
+        if let Some(next) = self.next {
+            unsafe { access_shared(queue, next.as_ptr()) }.1.prev = self.prev;
+        } else {
+            queue.tail = self.prev;
+        }
+
+        queue.len -= 1;
+    }
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -428,7 +455,6 @@ enum State {
 
 union Value<F, R> {
     queued: ManuallyDrop<F>,
-    running: (),
     completed: ManuallyDrop<R>,
     panicked: ManuallyDrop<Box<dyn core::any::Any + Send + 'static>>,
 }
@@ -436,22 +462,36 @@ union Value<F, R> {
 /// # Safety:
 /// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
 /// `task.shared.state` must be `Running`
-unsafe fn run_once<Ctx, F, R>(task: *mut PlungerTaskShared<Ctx>, ctx: &mut Ctx) -> State
+unsafe fn task_state<'a, Ctx, F, R>(
+    shared: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
+) -> &'a mut Value<F, R> {
+    let offset = const {
+        offset_of!(PlungerTask<Ctx, F, R>, state) as isize
+            - offset_of!(PlungerTask<Ctx, F, R>, shared) as isize
+    };
+
+    // safety: caller ensures this is a valid PlungerTask
+    let task_state = unsafe { shared.byte_offset(offset).cast::<UnsafeCell<Value<F, R>>>() };
+
+    // safety: caller ensures that state is Running, so we own this.
+    unsafe { &mut *(*task_state).get() }
+}
+
+/// # Safety:
+/// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
+/// `task.shared.state` must be `Running`
+unsafe fn run_once<Ctx, F, R>(
+    shared: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
+    ctx: &mut Ctx,
+) -> State
 where
     F: FnOnce(&mut Ctx) -> R + 'static,
     Ctx: UnwindSafe,
 {
-    let offset = offset_of!(PlungerTask<Ctx, F, R>, shared);
-
-    // safety: caller ensures this is a valid PlungerTask
-    let task = unsafe { &mut *task.byte_sub(offset).cast::<PlungerTask<Ctx, F, R>>() };
-
     // safety: caller ensures that state is Running, so we own this.
-    let task_state = unsafe { &mut *task.state.get() };
+    let task_state = unsafe { task_state::<Ctx, F, R>(shared) };
 
     let func = unsafe { ManuallyDrop::take(&mut task_state.queued) };
-    task_state.running = ();
-
     match std::panic::catch_unwind(AssertUnwindSafe(|| func(ctx))) {
         Ok(output) => {
             task_state.completed = ManuallyDrop::new(output);
@@ -467,32 +507,27 @@ where
 /// # Safety:
 /// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
 /// `task.shared.state` must be `Running`
-unsafe fn run_repeat<Ctx, F, R>(task: *mut PlungerTaskShared<Ctx>, ctx: &mut Ctx) -> State
+unsafe fn run_repeat<Ctx, F, R>(
+    shared: *mut UnsafeCell<PlungerTaskShared<Ctx>>,
+    ctx: &mut Ctx,
+) -> State
 where
     F: FnMut(&mut Ctx) -> Poll<R> + 'static,
     Ctx: UnwindSafe,
 {
-    let offset = offset_of!(PlungerTask<Ctx, F, R>, shared);
-
-    // safety: caller ensures this is a valid PlungerTask
-    let task = unsafe { &mut *task.byte_sub(offset).cast::<PlungerTask<Ctx, F, R>>() };
-
     // safety: caller ensures that state is Running, so we own this.
-    let task_state = unsafe { &mut *task.state.get() };
+    let task_state = unsafe { task_state::<Ctx, F, R>(shared) };
 
-    let mut func = unsafe { ManuallyDrop::take(&mut task_state.queued) };
-    task_state.running = ();
-
+    let func = unsafe { &mut task_state.queued };
     match std::panic::catch_unwind(AssertUnwindSafe(|| func(ctx))) {
-        Ok(Poll::Pending) => {
-            task_state.queued = ManuallyDrop::new(func);
-            State::Queued
-        }
+        Ok(Poll::Pending) => State::Queued,
         Ok(Poll::Ready(output)) => {
+            unsafe { ManuallyDrop::drop(&mut task_state.queued) };
             task_state.completed = ManuallyDrop::new(output);
             State::Completed
         }
         Err(panic) => {
+            unsafe { ManuallyDrop::drop(&mut task_state.queued) };
             task_state.panicked = ManuallyDrop::new(panic);
             State::Panicked
         }
@@ -537,36 +572,18 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
         let mut guard = plunger.inner.queue.lock();
 
         // we can only touch the inner shared while the queue is locked.
-        let (queue, shared) = unsafe { access_shared(&mut guard, task.shared.get()) };
+        let (queue, shared) =
+            unsafe { access_shared(&mut guard, std::ptr::from_ref(&task.shared).cast_mut()) };
 
         let notify = match shared.state {
-            // exit immediately.
-            State::Init if unlink => {
-                // safety: state is Init, so we own this.
-                let task_state = unsafe { &mut *task.state.get() };
-                unsafe { ManuallyDrop::drop(&mut task_state.queued) };
-
-                *this.plunger = None;
-                return Poll::Ready(Ok(None));
-            }
-            // unlink before exiting.
-            State::Queued if unlink => {
-                // unlink from the queue
-                if let Some(prev) = shared.prev {
-                    unsafe { access_shared(queue, prev.as_ptr()) }.1.next = shared.next;
-                } else {
-                    queue.head = shared.next;
+            State::Init | State::Queued if unlink => {
+                if shared.state == State::Queued {
+                    // unlink from the queue
+                    unsafe {
+                        shared.unlink(queue);
+                    }
+                    shared.state = State::Init;
                 }
-
-                if let Some(next) = shared.next {
-                    unsafe { access_shared(queue, next.as_ptr()) }.1.prev = shared.prev;
-                } else {
-                    queue.tail = shared.prev;
-                }
-
-                queue.len -= 1;
-
-                shared.state = State::Init;
 
                 // safety: state is Init, so we own this.
                 let task_state = unsafe { &mut *task.state.get() };
@@ -580,25 +597,21 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
                 shared.waker.clone_from(cx.waker());
 
                 // get our shared pointer
-                let ptr = NonNull::new(task.shared.get());
+                // this is a bit awkward to preserve the borrow stack.
+                let ptr = unsafe {
+                    NonNull::from(task)
+                        .byte_add(const { offset_of!(PlungerTask<Ctx, F, R>, shared) })
+                        .cast()
+                };
 
-                // link into the queue
-                shared.prev = core::mem::replace(&mut queue.tail, ptr);
-                if let Some(prev) = shared.prev {
-                    unsafe { access_shared(queue, prev.as_ptr()) }.1.next = ptr;
-                } else {
-                    queue.head = ptr;
-                }
-                queue.len += 1;
-
-                // mark as linked.
-                shared.state = State::Queued;
+                unsafe { PlungerTaskShared::link(ptr, queue) };
 
                 // notify that a task is now ready.
                 true
             }
             // keep waiting.
             State::Queued | State::Running => {
+                shared.shutdown = unlink;
                 shared.waker.clone_from(cx.waker());
 
                 // do not notify about a new task.
@@ -664,8 +677,8 @@ mod tests {
 
     use crate::Plunger;
 
-    #[tokio::test]
-    async fn basic() {
+    #[test]
+    fn basic() {
         let plunger = Plunger::with_threads(NonZero::new(1).unwrap());
 
         let lhs_res = String::from("lhs");
@@ -680,20 +693,75 @@ mod tests {
             rhs_res
         });
 
-        let (lhs_res, rhs_res) = match futures::future::select(lhs, rhs).await {
-            Either::Left(_) => {
-                panic!("rhs should complete first.")
-            }
-            Either::Right((rhs_res, lhs)) => (lhs.await, rhs_res),
-        };
+        let (lhs_res, rhs_res) = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                match futures::future::select(lhs, rhs).await {
+                    Either::Left(_) => {
+                        panic!("rhs should complete first.")
+                    }
+                    Either::Right((rhs_res, lhs)) => (lhs.await, rhs_res),
+                }
+            });
 
         assert_eq!(&*lhs_res, "lhs");
         assert_eq!(&*rhs_res, "rhs");
     }
 
     #[ignore = "slow"]
+    #[test]
+    fn smoke() {
+        let body = async {
+            const N: u32 = 10;
+            const M: u32 = 10;
+            let plunger = Arc::new(Plunger::with_threads(NonZero::new(4).unwrap()));
+            let mut join_set = JoinSet::new();
+            for _ in 0..N {
+                let plunger = plunger.clone();
+                join_set.spawn(async move {
+                    for m in 0..M {
+                        let mut i = 0;
+                        let mut salt = [0; 32];
+                        let pw = black_box(b"hunter2");
+
+                        let job = plunger.unblock_repeat_ctx(move |()| {
+                            i += 1;
+
+                            let res = pbkdf2_hmac_array::<sha2::Sha256, 32>(pw, &salt, 1);
+
+                            if i >= 2 {
+                                std::task::Poll::Ready(res)
+                            } else {
+                                salt = res;
+                                std::task::Poll::Pending
+                            }
+                        });
+
+                        if m % 5 == 4 {
+                            _ = black_box(
+                                tokio::time::timeout(Duration::from_micros(50), job).await,
+                            );
+                        } else {
+                            black_box(job.await);
+                        }
+                    }
+                });
+            }
+            join_set.join_all().await;
+        };
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("Failed building the Runtime")
+            .block_on(body);
+    }
+
+    #[ignore = "slow"]
     #[tokio::test]
-    async fn smoke() {
+    async fn perforamnce_sanity_check() {
         const N: u32 = 1000;
         const M: u32 = 1000;
 
