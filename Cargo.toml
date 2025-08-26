@@ -1,12 +1,13 @@
 [package]
 name = "plunger"
-version = "0.1.0-rc.0"
+version = "0.1.0-rc.1"
 authors = ["Conrad Ludgate <conradludgate@gmail.com>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Plunger helps you quickly unblock your async tasks"
 categories = ["asynchronous"]
 keywords = ["async", "non-blocking", "futures"]
+repository = "https://github.com/conradludgate/plunger"
 
 [features]
 default = ["tokio"]
