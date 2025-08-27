@@ -1,9 +1,7 @@
 use std::{
     cell::UnsafeCell,
-    mem::ManuallyDrop,
-    panic::{AssertUnwindSafe, UnwindSafe},
+    panic::UnwindSafe,
     pin::Pin,
-    ptr::NonNull,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -13,72 +11,49 @@ use futures_util::task::waker_ref;
 use pinned_aliasable::Aliasable;
 
 use crate::{
-    JobComplete, Plunger, Types, block,
+    JobComplete, Plunger, RawDynJob, Types, block,
+    job::Job,
     pin_list::{Node, NodeData},
 };
 
 pin_project_lite::pin_project!(
-    pub(super) struct Task<'a, Ctx, F, R> {
+    pub(super) struct Task<'a, Ctx, J: Job<Ctx>> {
         #[pin]
-        state: Aliasable<UnsafeCell<Value<F, R>>>,
+        state: Aliasable<UnsafeCell<J>>,
 
         #[pin]
         node: Node<Types<Ctx>>,
 
-        job: unsafe fn(inout: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>,
-
         plunger: Option<&'a Plunger<Ctx>>,
     }
 
-    impl<Ctx, F, R> PinnedDrop for Task<'_, Ctx, F, R> {
+    impl<Ctx, J: Job<Ctx>> PinnedDrop for Task<'_, Ctx, J> {
         fn drop(mut this: Pin<&mut Self>) {
             this.drop_inner();
         }
     }
 );
 
-unsafe impl<Ctx, F: Send, R: Send> Send for Task<'_, Ctx, F, R> {}
+unsafe impl<Ctx, J: Job<Ctx> + Send> Send for Task<'_, Ctx, J> {}
 
-impl<Ctx, F, R> UnwindSafe for Task<'_, Ctx, F, R> {}
+impl<Ctx, J: Job<Ctx>> UnwindSafe for Task<'_, Ctx, J> {}
 
-impl<'a, Ctx, F, R> Task<'a, Ctx, F, R> {
+impl<'a, Ctx, J: Job<Ctx>> Task<'a, Ctx, J> {
     #[inline(always)]
-    pub(super) fn once(plunger: &'a Plunger<Ctx>, task: F) -> impl Future<Output = R>
+    pub(super) fn new(plunger: &'a Plunger<Ctx>, job: J) -> Self
     where
         Ctx: UnwindSafe,
-        F: FnOnce(&mut Ctx) -> R + Send + 'static,
-        R: Send + 'static,
     {
         Self {
-            state: Aliasable::new(UnsafeCell::new(Value {
-                queued: ManuallyDrop::new(task),
-            })),
+            state: Aliasable::new(UnsafeCell::new(job)),
             node: Node::new(DiatomicWaker::new()),
-            job: run_once::<Ctx, F, R>,
-            plunger: Some(plunger),
-        }
-    }
-
-    #[inline(always)]
-    pub(super) fn until(plunger: &'a Plunger<Ctx>, task: F) -> impl Future<Output = R>
-    where
-        Ctx: UnwindSafe,
-        F: FnMut(&mut Ctx) -> Poll<R> + Send + 'static,
-        R: Send + 'static,
-    {
-        Self {
-            state: Aliasable::new(UnsafeCell::new(Value {
-                queued: ManuallyDrop::new(task),
-            })),
-            node: Node::new(DiatomicWaker::new()),
-            job: run_repeat::<Ctx, F, R>,
             plunger: Some(plunger),
         }
     }
 }
 
-impl<Ctx, F, R> Future for Task<'_, Ctx, F, R> {
-    type Output = R;
+impl<Ctx, J: Job<Ctx> + Send + 'static> Future for Task<'_, Ctx, J> {
+    type Output = J::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
@@ -87,14 +62,7 @@ impl<Ctx, F, R> Future for Task<'_, Ctx, F, R> {
         };
 
         let Some(node) = this.node.as_mut().initialized_mut() else {
-            // get our shared pointer
-            // this is a bit awkward to preserve the borrow stack.
-            let data = NonNull::from(this.state.as_ref().get()).as_ptr().cast();
-
-            let job = Job {
-                job: *this.job,
-                data,
-            };
+            let job = unsafe { RawDynJob::new(this.state.as_ref()) };
 
             let mut guard = plunger.inner.queue.lock();
             guard.len += 1;
@@ -119,29 +87,20 @@ impl<Ctx, F, R> Future for Task<'_, Ctx, F, R> {
 
         drop(guard);
 
+        *this.plunger = None;
         let completion = unsafe { node.take_removed_unchecked() };
 
         // safety: no longer shared
         let task_state = unsafe { &mut *this.state.as_ref().get().get() };
 
         match completion {
-            JobComplete::Success => {
-                let output = unsafe { ManuallyDrop::take(&mut task_state.completed) };
-
-                *this.plunger = None;
-                Poll::Ready(output)
-            }
-            JobComplete::Panic => {
-                let output = unsafe { ManuallyDrop::take(&mut task_state.panicked) };
-
-                *this.plunger = None;
-                std::panic::resume_unwind(output)
-            }
+            JobComplete::Success => Poll::Ready(unsafe { task_state.output() }),
+            JobComplete::Panic => unsafe { task_state.resume() },
         }
     }
 }
 
-impl<Ctx, F, R> Task<'_, Ctx, F, R> {
+impl<Ctx, J: Job<Ctx>> Task<'_, Ctx, J> {
     #[inline]
     fn drop_inner(self: Pin<&mut Self>) {
         let mut this = self.project();
@@ -152,7 +111,7 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
         let Some(mut node) = this.node.as_mut().initialized_mut() else {
             // safety: state is Init, so we own this.
             let task_state = unsafe { &mut *this.state.as_ref().get().get() };
-            unsafe { ManuallyDrop::drop(&mut task_state.queued) };
+            unsafe { task_state.discard_init() }
             return;
         };
 
@@ -184,94 +143,11 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
 
         match data {
             // safety: we were linked in the queue, so the queued value must be initialised
-            NodeData::Linked(_) => unsafe { ManuallyDrop::drop(&mut task_state.queued) },
+            NodeData::Linked(_) => unsafe { task_state.discard_init() },
             NodeData::Released(JobComplete::Success) => unsafe {
-                ManuallyDrop::drop(&mut task_state.completed)
+                task_state.output();
             },
-            NodeData::Released(JobComplete::Panic) => unsafe {
-                ManuallyDrop::drop(&mut task_state.panicked)
-            },
-        }
-    }
-}
-
-// todo: how can we store a `&mut dyn FnMut(&mut Ctx) -> Poll<()>` inside of pin_list :think:
-pub(super) struct Job<Ctx> {
-    job: unsafe fn(inout: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>,
-    data: *mut (),
-}
-
-unsafe impl<Ctx> Send for Job<Ctx> {}
-
-impl<Ctx> Job<Ctx> {
-    pub(super) fn run(&mut self, ctx: &mut Ctx) -> Poll<JobComplete> {
-        unsafe { (self.job)(self.data, ctx) }
-    }
-}
-
-union Value<F, R> {
-    queued: ManuallyDrop<F>,
-    completed: ManuallyDrop<R>,
-    panicked: ManuallyDrop<Box<dyn core::any::Any + Send + 'static>>,
-}
-
-/// # Safety:
-/// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
-/// `task.shared.state` must be `Running`
-unsafe fn task_state<'a, F, R>(task_state: *mut ()) -> &'a mut Value<F, R> {
-    let task_state = task_state.cast::<UnsafeCell<Value<F, R>>>();
-
-    // safety: caller ensures that state is Running, so we own this.
-    unsafe { &mut *(*task_state).get() }
-}
-
-/// # Safety:
-/// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
-/// `task.shared.state` must be `Running`
-unsafe fn run_once<Ctx, F, R>(state: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>
-where
-    F: FnOnce(&mut Ctx) -> R + 'static,
-    Ctx: UnwindSafe,
-{
-    // safety: caller ensures that state is Running, so we own this.
-    let task_state = unsafe { task_state::<F, R>(state) };
-
-    let func = unsafe { ManuallyDrop::take(&mut task_state.queued) };
-    match std::panic::catch_unwind(AssertUnwindSafe(|| func(ctx))) {
-        Ok(output) => {
-            task_state.completed = ManuallyDrop::new(output);
-            Poll::Ready(JobComplete::Success)
-        }
-        Err(panic) => {
-            task_state.panicked = ManuallyDrop::new(panic);
-            Poll::Ready(JobComplete::Panic)
-        }
-    }
-}
-
-/// # Safety:
-/// `task` must be from a `*mut PlungerTask<Ctx, F, R>` and it must be safe to deref.
-/// `task.shared.state` must be `Running`
-unsafe fn run_repeat<Ctx, F, R>(state: *mut (), ctx: &mut Ctx) -> Poll<JobComplete>
-where
-    F: FnMut(&mut Ctx) -> Poll<R> + 'static,
-    Ctx: UnwindSafe,
-{
-    // safety: caller ensures that state is Running, so we own this.
-    let task_state = unsafe { task_state::<F, R>(state) };
-
-    let func = unsafe { &mut task_state.queued };
-    match std::panic::catch_unwind(AssertUnwindSafe(|| func(ctx))) {
-        Ok(Poll::Pending) => Poll::Pending,
-        Ok(Poll::Ready(output)) => {
-            unsafe { ManuallyDrop::drop(&mut task_state.queued) };
-            task_state.completed = ManuallyDrop::new(output);
-            Poll::Ready(JobComplete::Success)
-        }
-        Err(panic) => {
-            unsafe { ManuallyDrop::drop(&mut task_state.queued) };
-            task_state.panicked = ManuallyDrop::new(panic);
-            Poll::Ready(JobComplete::Panic)
+            NodeData::Released(JobComplete::Panic) => unsafe { task_state.discard_unwind() },
         }
     }
 }

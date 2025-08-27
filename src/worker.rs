@@ -1,6 +1,4 @@
-use std::{sync::Arc, task::Poll};
-
-use parking_lot::lock_api::MutexGuard;
+use std::sync::Arc;
 
 use crate::{Inner, Shutdown};
 
@@ -33,7 +31,7 @@ impl<Ctx> Worker<Ctx> {
     pub fn run(self, mut ctx: Ctx) {
         let mut guard = self.inner.queue.lock();
         let shutdown = loop {
-            let Ok((mut job, node)) = guard.list.acquire_front(false) else {
+            let Ok((job, node)) = guard.list.acquire_front(false) else {
                 if let Some(shutdown) = &guard.shutdown {
                     break shutdown.clone();
                 }
@@ -42,21 +40,7 @@ impl<Ctx> Worker<Ctx> {
                 continue;
             };
 
-            let result = MutexGuard::unlocked(&mut guard, || job.run(&mut ctx));
-
-            match result {
-                Poll::Pending => {
-                    if *node.acquired(&guard.list) {
-                        node.unprotected(&guard.list).notify();
-                    }
-                    node.insert_after(&mut guard.list.cursor_back_mut(), job);
-                }
-                Poll::Ready(result) => {
-                    guard.len -= 1;
-                    node.unprotected(&guard.list).notify();
-                    node.release_current(&mut guard.list, result);
-                }
-            }
+            job.run_job(node, &mut guard, &mut ctx);
         };
 
         drop(guard);

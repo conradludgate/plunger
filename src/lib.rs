@@ -26,6 +26,7 @@
 
 mod always_send_sync;
 mod block;
+mod job;
 mod pin_list;
 mod task;
 mod worker;
@@ -41,10 +42,7 @@ use std::{
 use diatomic_waker::DiatomicWaker;
 use parking_lot::{Condvar, Mutex};
 
-use crate::{
-    pin_list::PinList,
-    task::{Job, Task},
-};
+use crate::{job::RawDynJob, pin_list::PinList, task::Task};
 
 pub use worker::Worker;
 
@@ -262,7 +260,7 @@ impl<Ctx> Plunger<Ctx> {
         F: FnOnce(&mut Ctx) -> R + Send + 'static,
         R: Send + 'static,
     {
-        Task::once(self, task)
+        Task::new(self, crate::job::Once::new(task))
     }
 
     /// Run the CPU intensive code in the thread pool, avoiding blocking the async runtime.
@@ -289,7 +287,7 @@ impl<Ctx> Plunger<Ctx> {
         F: FnMut(&mut Ctx) -> Poll<R> + Send + 'static,
         R: Send + 'static,
     {
-        Task::until(self, task)
+        Task::new(self, crate::job::Until::new(task))
     }
 
     pub fn workers(&self) -> usize {
@@ -314,7 +312,7 @@ struct PlungerQueue<Ctx> {
 
 type Types<Ctx> = dyn pin_list::Types<
         Id = pin_list::id::DebugChecked,
-        Protected = Job<Ctx>,
+        Protected = RawDynJob<Ctx>,
         Acquired = bool,
         Released = JobComplete,
         Unprotected = DiatomicWaker,

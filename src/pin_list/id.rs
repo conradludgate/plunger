@@ -39,6 +39,7 @@ impl<I: Id> Unique<I> {
 // SAFETY: `Unique<I>` functions as a `SyncWrapper`
 unsafe impl<I: Id> Sync for Unique<I> {}
 
+#[cfg(debug_assertions)]
 #[cfg(target_has_atomic = "64")]
 mod checked {
     use super::Id;
@@ -81,8 +82,6 @@ mod checked {
     // SAFETY: `new` can never return two `u64`s with the same value.
     unsafe impl Id for Checked {}
 }
-#[cfg(target_has_atomic = "64")]
-pub use checked::Checked;
 
 #[cfg(target_has_atomic = "64")]
 mod debug_checked {
@@ -97,7 +96,7 @@ mod debug_checked {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DebugChecked {
         #[cfg(debug_assertions)]
-        checked: id::Checked,
+        checked: id::checked::Checked,
     }
 
     impl DebugChecked {
@@ -115,7 +114,7 @@ mod debug_checked {
         pub unsafe fn new() -> Unique<Self> {
             let this = Self {
                 #[cfg(debug_assertions)]
-                checked: id::Checked::new().into_inner(),
+                checked: id::checked::Checked::new().into_inner(),
             };
             // SAFETY: Ensured by callera
             unsafe { Unique::new(this) }
