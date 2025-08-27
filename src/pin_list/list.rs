@@ -277,9 +277,8 @@ impl<T: ?Sized + Types> PinList<T> {
         &mut self,
         node: Pin<&'node mut Node<T>>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
     ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        node.insert_before(&mut self.cursor_ghost_mut(), protected, unprotected)
+        node.insert_before(&mut self.cursor_ghost_mut(), protected)
     }
 }
 

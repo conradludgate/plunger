@@ -438,6 +438,7 @@ dependencies = [
  "pbkdf2",
  "pin-project-lite",
  "pinned-aliasable",
+ "replace_with",
  "sha2",
  "tokio",
  "tracing",
@@ -478,6 +479,12 @@ checksum = "5407465600fb0548f1442edf71dd20683c6ed326200ace4b1ef0763521bb3b77"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "replace_with"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51743d3e274e2b18df81c4dc6caf8a5b8e15dbe799e0dca05c7617380094e884"
 
 [[package]]
 name = "rustc-demangle"

@@ -48,9 +48,8 @@ pin_project! {
         T: ?Sized,
         T: Types,
     {
-        // `None` if initial, `Some` if initialized
         #[pin]
-        inner: Option<NodeInner<T>>,
+        inner: NodeInitInner<T>,
     }
 
     impl<T> PinnedDrop for Node<T>
@@ -61,9 +60,49 @@ pin_project! {
         fn drop(this: Pin<&mut Self>) {
             // If we might be linked into a list at this point in time, we have no choice but to
             // abort in order to preserve soundness and prevent use-after-frees.
-            if this.inner.is_some() {
+            if matches!(this.inner, NodeInitInner::Initialised{..}) {
                 abort();
             }
+        }
+    }
+}
+
+pin_project! {
+    enum NodeInitInner<T>
+    where
+        T: ?Sized,
+        T: Types,
+    {
+        Uninitialised {
+            unprotected: T::Unprotected,
+        },
+        Initialised{
+            #[pin]
+            inner: NodeInner<T>,
+        },
+    }
+}
+
+impl<T: ?Sized + Types> NodeInitInner<T> {
+    fn take(&mut self) -> Option<UnsafeCell<NodeProtected<T>>> {
+        replace_with::replace_with_or_abort_and_return(self, |this| match this {
+            NodeInitInner::Uninitialised { .. } => (None, this),
+            NodeInitInner::Initialised { inner } => {
+                let shared = inner.shared.into_inner();
+                (
+                    Some(shared.protected),
+                    NodeInitInner::Uninitialised {
+                        unprotected: shared.unprotected,
+                    },
+                )
+            }
+        })
+    }
+
+    fn init(&self) -> Option<&NodeInner<T>> {
+        match self {
+            NodeInitInner::Uninitialised { .. } => None,
+            NodeInitInner::Initialised { inner } => Some(inner),
         }
     }
 }
@@ -155,14 +194,19 @@ where
 {
     /// Create a new node in its initial state.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { inner: None }
+    pub const fn new(unprotected: T::Unprotected) -> Self {
+        Self {
+            inner: NodeInitInner::Uninitialised { unprotected },
+        }
     }
 }
 
-impl<T: ?Sized + Types> Default for Node<T> {
+impl<T: ?Sized + Types> Default for Node<T>
+where
+    T::Unprotected: Default,
+{
     fn default() -> Self {
-        Self::new()
+        Self::new(Default::default())
     }
 }
 
@@ -176,12 +220,11 @@ impl<T: ?Sized + Types> Node<T> {
         self: Pin<&mut Self>,
         cursor: &mut CursorMut<'_, T>,
         protected: T::Protected,
-        unprotected: T::Unprotected,
     ) -> Pin<&mut InitializedNode<'_, T>> {
         let prev = *cursor.prev_mut();
 
         // Store our own state as linked.
-        let node = self.init(NodeInner {
+        let node = self.init(|unprotected| NodeInner {
             list_id: cursor.list().id,
             shared: Aliasable::new(NodeShared {
                 protected: UnsafeCell::new(NodeProtected::Linked(NodeLinked {
@@ -202,12 +245,28 @@ impl<T: ?Sized + Types> Node<T> {
         node
     }
 
-    fn init(mut self: Pin<&mut Self>, new_inner: NodeInner<T>) -> Pin<&mut InitializedNode<'_, T>> {
-        let mut inner = self.as_mut().project().inner;
+    fn init(
+        mut self: Pin<&mut Self>,
+        new_inner: impl FnOnce(T::Unprotected) -> NodeInner<T>,
+    ) -> Pin<&mut InitializedNode<'_, T>> {
+        let inner = self.as_mut().project().inner;
 
-        assert!(inner.is_none(), "attempted to link an already-linked node");
+        // safety: we will not move any data that needs to be pinned.
+        let inner = unsafe { inner.get_unchecked_mut() };
+        let replaced = replace_with::replace_with_or_abort_and_return(inner, |inner| match inner {
+            NodeInitInner::Uninitialised { unprotected } => (
+                Ok(()),
+                NodeInitInner::Initialised {
+                    inner: new_inner(unprotected),
+                },
+            ),
+            // safety: initialised needs to stay as it is.
+            NodeInitInner::Initialised { .. } => (Err(new_inner), inner),
+        });
 
-        inner.set(Some(new_inner));
+        if replaced.is_err() {
+            panic!("attempted to link an already-linked node");
+        }
 
         // SAFETY: We just set the inner to `Some`.
         unsafe { InitializedNode::new_mut_unchecked(self) }
@@ -271,14 +330,14 @@ impl<T: ?Sized + Types> Deref for InitializedNode<'_, T> {
 impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     #![expect(clippy::transmute_ptr_to_ptr)]
     fn new_ref(node: &'node Node<T>) -> Option<&'node Self> {
-        node.inner.as_ref()?;
+        node.inner.init()?;
         // SAFETY: We have just asserted that `inner` is `Some` and we are `#[repr(transparent)]`
         // over `Node<T>`.
         Some(unsafe { mem::transmute::<&'node Node<T>, &'node InitializedNode<'node, T>>(node) })
     }
 
     fn new_mut(node: Pin<&'node mut Node<T>>) -> Option<Pin<&'node mut Self>> {
-        node.inner.as_ref()?;
+        node.inner.init()?;
         // SAFETY: We have just asserted that `inner` is `Some`.
         Some(unsafe { Self::new_mut_unchecked(node) })
     }
@@ -295,7 +354,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
 
     fn inner(&self) -> Pin<&NodeInner<T>> {
         // SAFETY: In order for this type to exist, the node must be initialized.
-        let inner = unsafe { unwrap_unchecked(self.node.inner.as_ref()) };
+        let inner = unsafe { unwrap_unchecked(self.node.inner.init()) };
 
         // SAFETY: In order for this state to be created, we must already have been pinned.
         unsafe { Pin::new_unchecked(inner) }
@@ -395,7 +454,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     pub fn unlink(
         self: Pin<&'node mut Self>,
         list: &mut PinList<T>,
-    ) -> Result<(T::Protected, T::Unprotected), Pin<&'node mut Self>> {
+    ) -> Result<T::Protected, Pin<&'node mut Self>> {
         assert_eq!(self.inner().list_id, list.id, "incorrect `PinList`");
 
         // SAFETY: We have exclusive access to both the node and the list.
@@ -410,10 +469,10 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
 
         // SAFETY: We just unlinked ourselves from the list.
         match unsafe { self.take_unchecked() } {
-            (NodeData::Linked(linked), unprotected) => Ok((linked, unprotected)),
+            NodeData::Linked(linked) => Ok(linked),
             // SAFETY: We asserted at the beginning of this function that we were in the linked
             // state.
-            (NodeData::Released(_), _) => unsafe { debug_unreachable!() },
+            NodeData::Released(_) => unsafe { debug_unreachable!() },
         }
     }
 
@@ -433,7 +492,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     pub fn take_removed(
         self: Pin<&'node mut Self>,
         list: &PinList<T>,
-    ) -> Result<(T::Released, T::Unprotected), Pin<&'node mut Self>> {
+    ) -> Result<T::Released, Pin<&'node mut Self>> {
         assert_eq!(self.inner().list_id, list.id, "incorrect `PinList`");
 
         // Only create a shared reference because we only have shared access to the `PinList`. In
@@ -460,12 +519,10 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     #[must_use]
     // Take `&'node mut Self` instead of `&mut Self` to ensure that this reference is not used
     // after this point.
-    pub unsafe fn take_removed_unchecked(
-        self: Pin<&'node mut Self>,
-    ) -> (T::Released, T::Unprotected) {
+    pub unsafe fn take_removed_unchecked(self: Pin<&'node mut Self>) -> T::Released {
         // SAFETY: Ensured by caller.
         match unsafe { self.take_unchecked() } {
-            (NodeData::Linked(_), _) => {
+            NodeData::Linked(_) => {
                 // oops! the caller has violated the safety invariants of this function. we may
                 // have even already caused UB in `take_unchecked`.
                 // SAFETY: Ensured by caller.
@@ -475,7 +532,7 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
                     )
                 }
             }
-            (NodeData::Released(removed), unprotected) => (removed, unprotected),
+            NodeData::Released(removed) => removed,
         }
     }
 
@@ -487,21 +544,19 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     /// `Linked` states.
     // Take `&'node mut Self` instead of `&mut Self` to ensure that this reference is not used
     // after this point.
-    unsafe fn take_unchecked(self: Pin<&'node mut Self>) -> (NodeData<T>, T::Unprotected) {
+    unsafe fn take_unchecked(self: Pin<&'node mut Self>) -> NodeData<T> {
         // SAFETY: Since the caller asserts that we have been removed, we no longer need to be
         // pinned.
         let this = unsafe { &mut Pin::into_inner_unchecked(self).node };
 
-        let old_node = this.inner.take();
+        let protected = this.inner.take();
         // SAFETY: In order for this type to exist, the node must be initialized.
-        let old_inner = unsafe { unwrap_unchecked(old_node) };
-        let old_shared = old_inner.shared.into_inner();
-        let data = match old_shared.protected.into_inner() {
+        let protected = unsafe { unwrap_unchecked(protected) };
+        match protected.into_inner() {
             NodeProtected::Linked(NodeLinked { data, .. }) => NodeData::Linked(data),
             NodeProtected::Acquired(NodeAcquired { .. }) => unsafe { debug_unreachable!() },
             NodeProtected::Released(NodeReleased { data }) => NodeData::Released(data),
-        };
-        (data, old_shared.unprotected)
+        }
     }
 
     /// Reset the node back to its initial state.
@@ -520,11 +575,11 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
     pub fn reset(
         self: Pin<&'node mut Self>,
         list: &mut PinList<T>,
-    ) -> Result<(NodeData<T>, T::Unprotected), Pin<&'node mut Self>> {
+    ) -> Result<NodeData<T>, Pin<&'node mut Self>> {
         match self.unlink(list) {
-            Ok((protected, unprotected)) => Ok((NodeData::Linked(protected), unprotected)),
+            Ok(protected) => Ok(NodeData::Linked(protected)),
             Err(this) => match this.take_removed(list) {
-                Ok((removed, unprotected)) => Ok((NodeData::Released(removed), unprotected)),
+                Ok(removed) => Ok(NodeData::Released(removed)),
                 Err(this) => Err(this),
             },
         }

@@ -53,7 +53,7 @@ impl<'a, Ctx, F, R> Task<'a, Ctx, F, R> {
             state: Aliasable::new(UnsafeCell::new(Value {
                 queued: ManuallyDrop::new(task),
             })),
-            node: Node::new(),
+            node: Node::new(DiatomicWaker::new()),
             job: run_once::<Ctx, F, R>,
             plunger: Some(plunger),
         }
@@ -70,7 +70,7 @@ impl<'a, Ctx, F, R> Task<'a, Ctx, F, R> {
             state: Aliasable::new(UnsafeCell::new(Value {
                 queued: ManuallyDrop::new(task),
             })),
-            node: Node::new(),
+            node: Node::new(DiatomicWaker::new()),
             job: run_repeat::<Ctx, F, R>,
             plunger: Some(plunger),
         }
@@ -98,7 +98,7 @@ impl<Ctx, F, R> Future for Task<'_, Ctx, F, R> {
 
             let mut guard = plunger.inner.queue.lock();
             guard.len += 1;
-            let node = guard.list.push_back(this.node, job, DiatomicWaker::new());
+            let node = guard.list.push_back(this.node, job);
 
             unsafe { node.unprotected().register(cx.waker()) };
             drop(guard);
@@ -117,9 +117,9 @@ impl<Ctx, F, R> Future for Task<'_, Ctx, F, R> {
             return Poll::Pending;
         }
 
-        let (completion, _) = unsafe { node.take_removed_unchecked() };
-
         drop(guard);
+
+        let completion = unsafe { node.take_removed_unchecked() };
 
         // safety: no longer shared
         let task_state = unsafe { &mut *this.state.as_ref().get().get() };
@@ -161,7 +161,7 @@ impl<Ctx, F, R> Task<'_, Ctx, F, R> {
         let mut signal = None;
         let data = loop {
             match node.reset(&mut guard.list) {
-                Ok((data, _)) => break data,
+                Ok(data) => break data,
                 // currently running, cannot be removed
                 Err(err_node) => {
                     node = err_node;
