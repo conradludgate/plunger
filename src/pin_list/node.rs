@@ -1,6 +1,5 @@
 //! The `Node` type and its related APIs.
 
-use crate::pin_list::Cursor;
 use crate::pin_list::CursorMut;
 use crate::pin_list::PinList;
 use crate::pin_list::Types;
@@ -36,8 +35,12 @@ pin_project! {
     ///     The node has been linked into a [`PinList`]. It holds a `Protected` and an
     ///     `Unprotected`, of which the former can only be accessed when access to the [`PinList`]
     ///     can be proven. Dropping a node in this state will abort.
-    /// 3. **Removed:**
-    ///     The node has been removed from a [`PinList`]. It holds a `Removed` and an
+    /// 3. **Acquired:**
+    ///     The node has been removed from a [`PinList`]. It holds an `Acquired` and an
+    ///     `Unprotected`. of which the former can only be accessed when access to the [`PinList`]
+    ///     can be proven. Dropping a node in this state will abort.
+    /// 3. **Released:**
+    ///     The node has been removed from a [`PinList`]. It holds a `Released` and an
     ///     `Unprotected`. Similar to the "linked" state, proof of access to the [`PinList`] is
     ///     required for most operations. Dropping a node in this state will abort.
     pub struct Node<T>
@@ -94,11 +97,18 @@ where
     // require `T::Protected: Sync`). In other words, `Self: Send` alone only allows exclusive or
     // reentrant access which is OK by `Send + !Sync`.
     /* T::Protected: ?Sync, */
+    // Required because we can take and return instances of this type by value.
+    T::Acquired: Send,
+    // (SAFETY) Not required because multiple `&PinList`s on different threads are required to
+    // access this type in a `Sync`-requiring way, which would need `PinList: Sync` (which does
+    // require `T::Acquired: Sync`). In other words, `Self: Send` alone only allows exclusive or
+    // reentrant access which is OK by `Send + !Sync`.
+    /* T::Acquired: ?Sync, */
     // Required because we can take and return this type by value.
     T::Released: Send,
-    // (SAFETY) Not required because we never deal in `&T::Removed` — it's always passed by
+    // (SAFETY) Not required because we never deal in `&T::Released` — it's always passed by
     // ownership.
-    /* T::Removed: ?Sync, */
+    /* T::Released: ?Sync, */
     // Required because we can take and return this type by value.
     T::Unprotected: Send,
     // Required because values of this type can be shared between this node and its list.
@@ -118,13 +128,17 @@ where
     // isn't if `T::Protected: !Send` or `T::Protected: !Sync`.
     /* T::Protected: ?Send + ?Sync, */
 
+    // (SAFETY) Not required to be `Send` or `Sync` because the only methods that access it that
+    // take `&self` would require the `PinList` to be `Sync` to be called on two threads, which it
+    // isn't if `T::Acquired: !Send` or `T::Acquired: !Sync`.
+    /* T::Acquired: ?Send + ?Sync, */
+
     // (SAFETY) Not required because ownership of this type is only passed around when a
     // `Pin<&mut Node<T>>` is the receiver.
-    /* T::Removed: ?Send, */
-
-    // (SAFETY) Not required because we never deal in `&T::Removed` — it's always passed by
+    /* T::Released: ?Send, */
+    // (SAFETY) Not required because we never deal in `&T::Released` — it's always passed by
     // ownership.
-    /* T::Removed: ?Sync, */
+    /* T::Released: ?Sync, */
 
     // (SAFETY) Not required because ownership of this type is only passed around when a
     // `Pin<&mut Node<T>` is the receiver.
@@ -140,8 +154,6 @@ where
     T: Types,
 {
     /// Create a new node in its initial state.
-    ///
-    /// You can move this node into other states by functions like [`PinList::push_front`].
     #[must_use]
     pub const fn new() -> Self {
         Self { inner: None }
@@ -155,12 +167,6 @@ impl<T: ?Sized + Types> Default for Node<T> {
 }
 
 impl<T: ?Sized + Types> Node<T> {
-    /// Check whether the node is in its initial state.
-    #[must_use]
-    pub fn is_initial(&self) -> bool {
-        self.inner.is_none()
-    }
-
     /// Insert this node into the linked list before the given cursor.
     ///
     /// # Panics
@@ -187,46 +193,11 @@ impl<T: ?Sized + Types> Node<T> {
             }),
         });
 
+        let shared_ptr = NonNull::from(node.shared());
         // Update the previous node's `next` pointer and the next node's `prev` pointer to both
         // point to us.
-        *unsafe { cursor.list.cursor_mut(prev) }.next_mut() =
-            OptionNodeShared::some(node.shared_ptr());
-        *cursor.prev_mut() = OptionNodeShared::some(node.shared_ptr());
-
-        node
-    }
-
-    /// Insert this node into the linked list after the given cursor.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn insert_after(
-        self: Pin<&mut Self>,
-        cursor: &mut CursorMut<'_, T>,
-        protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&mut InitializedNode<'_, T>> {
-        let next = *cursor.next_mut();
-
-        // Store our own state as linked.
-        let node = self.init(NodeInner {
-            list_id: cursor.list().id,
-            shared: Aliasable::new(NodeShared {
-                protected: UnsafeCell::new(NodeProtected::Linked(NodeLinked {
-                    prev: cursor.current,
-                    next,
-                    data: protected,
-                })),
-                unprotected,
-            }),
-        });
-
-        // Update the previous node's `next` pointer and the next node's `prev` pointer to both
-        // point to us.
-        *cursor.next_mut() = OptionNodeShared::some(node.shared_ptr());
-        *unsafe { cursor.list.cursor_mut(next) }.prev_mut() =
-            OptionNodeShared::some(node.shared_ptr());
+        *unsafe { cursor.list.cursor_mut(prev) }.next_mut() = OptionNodeShared::some(shared_ptr);
+        *cursor.prev_mut() = OptionNodeShared::some(shared_ptr);
 
         node
     }
@@ -298,6 +269,7 @@ impl<T: ?Sized + Types> Deref for InitializedNode<'_, T> {
 }
 
 impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
+    #![expect(clippy::transmute_ptr_to_ptr)]
     fn new_ref(node: &'node Node<T>) -> Option<&'node Self> {
         node.inner.as_ref()?;
         // SAFETY: We have just asserted that `inner` is `Some` and we are `#[repr(transparent)]`
@@ -333,10 +305,6 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
         self.inner().project_ref().shared.get()
     }
 
-    fn shared_ptr(&self) -> NonNull<NodeShared<T>> {
-        NonNull::from(self.shared())
-    }
-
     /// Get a shared reference to the unprotected data of this node.
     #[must_use]
     pub fn unprotected(&self) -> &T::Unprotected {
@@ -357,38 +325,6 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
         // SAFETY: We have shared access to both `self` and our `PinList`, as guaranteed above.
         match unsafe { &*self.shared().protected.get() } {
             NodeProtected::Linked(linked) => Some(&linked.data),
-            NodeProtected::Acquired(..) | NodeProtected::Released(..) => None,
-        }
-    }
-
-    /// Get a unique reference to the protected data of this node.
-    ///
-    /// Returns [`None`] if the node is in its removed state (has been removed from the list).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the given list is a different one than this node was registered with.
-    #[must_use]
-    pub fn protected_mut<'list>(
-        &self,
-        list: &'list mut PinList<T>,
-    ) -> Option<&'list mut T::Protected> {
-        assert_eq!(self.inner().list_id, list.id, "incorrect `PinList`");
-
-        // Only create a shared reference because we only have a shared reference to `self`. In the
-        // `Linked` branch this doesn't end up mattering, but in the `Removed` branch it's possible
-        // that a `&NodeRemoved` existed at the time of calling this function.
-        match unsafe { &*self.shared().protected.get() } {
-            NodeProtected::Linked(..) => {
-                // SAFETY: We have unique access to the list, and we have asserted that the node
-                // isn't removed.
-                Some(match unsafe { &mut *self.shared().protected.get() } {
-                    NodeProtected::Linked(linked) => &mut linked.data,
-                    NodeProtected::Acquired(..) | NodeProtected::Released(..) => unsafe {
-                        debug_unreachable!()
-                    },
-                })
-            }
             NodeProtected::Acquired(..) | NodeProtected::Released(..) => None,
         }
     }
@@ -441,51 +377,6 @@ impl<'node, T: ?Sized + Types> InitializedNode<'node, T> {
                 })
             }
         }
-    }
-
-    /// Obtain a shared cursor pointing to this node.
-    ///
-    /// Returns [`None`] if the node was in its removed state (it was removed from the list).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the given list is a different one than this node was registered with.
-    #[must_use]
-    pub fn cursor<'list>(&self, list: &'list PinList<T>) -> Option<Cursor<'list, T>> {
-        assert_eq!(self.inner().list_id, list.id, "incorrect `PinList`");
-
-        // SAFETY: We have shared access to both this node and the list.
-        match unsafe { &*self.shared().protected.get() } {
-            NodeProtected::Linked(..) => {}
-            NodeProtected::Acquired(..) | NodeProtected::Released(..) => return None,
-        }
-
-        // SAFETY: We have shared access to the list, and this node is not removed from the list.
-        Some(unsafe { list.cursor(OptionNodeShared::some(self.shared_ptr())) })
-    }
-
-    /// Obtain a unique cursor pointing to this node.
-    ///
-    /// Returns [`None`] if the node was in its removed state (it was removed from the list).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the given list is a different one than this node was registered with.
-    #[must_use]
-    pub fn cursor_mut<'list>(&self, list: &'list mut PinList<T>) -> Option<CursorMut<'list, T>> {
-        assert_eq!(self.inner().list_id, list.id, "incorrect `PinList`");
-
-        // Only create a shared reference because we only have a shared reference to `self`. In the
-        // `Linked` branch this doesn't end up mattering, but in the `Removed` branch it's possible
-        // that a `&NodeRemoved` existed at the time of calling this function.
-        match unsafe { &*self.shared().protected.get() } {
-            NodeProtected::Linked(..) => {}
-            NodeProtected::Acquired(..) | NodeProtected::Released(..) => return None,
-        }
-
-        // SAFETY: We have exclusive access to the list, and this node is not removed from the
-        // list.
-        Some(unsafe { list.cursor_mut(OptionNodeShared::some(self.shared_ptr())) })
     }
 
     /// Remove this node from its containing list and take its data, leaving the node in its

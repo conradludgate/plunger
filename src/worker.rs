@@ -33,8 +33,7 @@ impl<Ctx> Worker<Ctx> {
     pub fn run(self, mut ctx: Ctx) {
         let mut guard = self.inner.queue.lock();
         let shutdown = loop {
-            let mut cursor = guard.list.cursor_front_mut();
-            let Ok((mut job, node)) = cursor.acquire_current(false) else {
+            let Ok((mut job, node)) = guard.list.acquire_front(false) else {
                 if let Some(shutdown) = &guard.shutdown {
                     break shutdown.clone();
                 }

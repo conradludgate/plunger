@@ -14,10 +14,16 @@ fn block_in_place<R>(f: impl FnOnce() -> R) -> R {
     if let Ok(handle) = tokio::runtime::Handle::try_current()
         && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
     {
+        log("block_in_place");
         return tokio::task::block_in_place(f);
     }
 
+    log("blocking");
     f()
+}
+
+fn log(mode: &str) {
+    tracing::warn!(mode, "blocking due to cancellation");
 }
 
 impl Signal {

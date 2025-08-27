@@ -99,7 +99,7 @@ where
 }
 
 /// `Plunger` quickly unblocks your async tasks.
-/// 
+///
 /// ## Example
 ///
 /// ```
@@ -159,7 +159,7 @@ impl<Ctx> Plunger<Ctx> {
     pub fn create() -> (Self, Worker<Ctx>) {
         let inner = Arc::new(Inner {
             queue: Mutex::new(PlungerQueue {
-                list: PinList::new(pin_list::id::Checked::new()),
+                list: PinList::new(unsafe { pin_list::id::DebugChecked::new() }),
                 len: 0,
                 workers: 1,
                 shutdown: None,
@@ -313,7 +313,7 @@ struct PlungerQueue<Ctx> {
 }
 
 type Types<Ctx> = dyn pin_list::Types<
-        Id = pin_list::id::Checked,
+        Id = pin_list::id::DebugChecked,
         Protected = Job<Ctx>,
         Acquired = bool,
         Released = JobComplete,

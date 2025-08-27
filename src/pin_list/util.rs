@@ -1,18 +1,5 @@
 //! Shared internal utilities.
 
-use core::mem::ManuallyDrop;
-
-pub(crate) fn run_on_drop<F: FnOnce()>(f: F) -> impl Drop {
-    RunOnDrop(ManuallyDrop::new(f))
-}
-
-struct RunOnDrop<F: FnOnce()>(ManuallyDrop<F>);
-impl<F: FnOnce()> Drop for RunOnDrop<F> {
-    fn drop(&mut self) {
-        (unsafe { ManuallyDrop::take(&mut self.0) })();
-    }
-}
-
 macro_rules! debug_unreachable {
     ($($tt:tt)*) => {
         if cfg!(debug_assertions) {

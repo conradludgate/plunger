@@ -84,35 +84,6 @@ mod checked {
 #[cfg(target_has_atomic = "64")]
 pub use checked::Checked;
 
-mod unchecked {
-    use super::Id;
-    use super::Unique;
-
-    /// An unchecked ID that leaves all the invariants up to the user. This is zero-cost, but
-    /// `unsafe` to use.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[non_exhaustive]
-    pub struct Unchecked;
-
-    impl Unchecked {
-        /// Create a new [`Unchecked`] ID.
-        ///
-        /// # Safety
-        ///
-        /// The returned ID must not be compared against any other `Unchecked` IDs that originated
-        /// from a different call to this function.
-        #[must_use]
-        pub const unsafe fn new() -> Unique<Self> {
-            // SAFETY: Ensured by caller
-            unsafe { Unique::new(Self) }
-        }
-    }
-
-    // SAFETY: Ensured by caller in `Unchecked::new`
-    unsafe impl Id for Unchecked {}
-}
-pub use unchecked::Unchecked;
-
 #[cfg(target_has_atomic = "64")]
 mod debug_checked {
     use super::Id;
@@ -156,35 +127,3 @@ mod debug_checked {
 }
 #[cfg(target_has_atomic = "64")]
 pub use debug_checked::DebugChecked;
-
-mod lifetime {
-    use super::Id;
-    use super::Unique;
-    use core::marker::PhantomData;
-
-    /// A fully statically checked ID based on invariant lifetimes and HRTBs.
-    ///
-    /// This is the same technique as used by `GhostCell`. While theoretically the best option
-    /// (being both safe and zero-cost), its infectious nature makes it not very useful in practice.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Lifetime<'id> {
-        invariant: PhantomData<fn(&'id ()) -> &'id ()>,
-    }
-
-    impl Lifetime<'_> {
-        /// Create a new lifetime-based ID usable in a specific scope.
-        pub fn scope<O, F>(f: F) -> O
-        where
-            F: for<'id> FnOnce(Unique<Lifetime<'id>>) -> O,
-        {
-            f(unsafe {
-                Unique::new(Lifetime {
-                    invariant: PhantomData,
-                })
-            })
-        }
-    }
-
-    unsafe impl Id for Lifetime<'_> {}
-}
-pub use lifetime::Lifetime;

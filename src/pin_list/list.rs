@@ -4,9 +4,7 @@ use crate::pin_list::Id;
 use crate::pin_list::InitializedNode;
 use crate::pin_list::Node;
 use crate::pin_list::id;
-use crate::pin_list::node;
 use crate::pin_list::util::debug_unreachable;
-use crate::pin_list::util::run_on_drop;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::fmt::Debug;
@@ -17,7 +15,6 @@ use core::mem::transmute;
 use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
-use std::process::abort;
 
 /// Types used in a [`PinList`]. This trait is used to avoid an excessive number of generic
 /// parameters on [`PinList`] and related types.
@@ -226,23 +223,6 @@ where
 }
 
 impl<T: ?Sized + Types> PinList<T> {
-    /// Check whether there are any nodes in this list.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        debug_assert_eq!(self.head.get().is_some(), self.tail.get().is_some());
-        self.head.get().is_none()
-    }
-
-    /// # Safety
-    ///
-    /// The node must be present in the list.
-    pub(crate) unsafe fn cursor(&self, current: OptionNodeShared<T>) -> Cursor<'_, T> {
-        Cursor {
-            list: self,
-            current,
-        }
-    }
-
     /// # Safety
     ///
     /// - The node must be present in the list.
@@ -253,31 +233,6 @@ impl<T: ?Sized + Types> PinList<T> {
             list: self,
             current,
         }
-    }
-
-    /// Obtain a `Cursor` pointing to the "ghost" element of the list.
-    #[must_use]
-    pub fn cursor_ghost(&self) -> Cursor<'_, T> {
-        // SAFETY: The ghost cursor is always in the list.
-        unsafe { self.cursor(OptionNodeShared::NONE) }
-    }
-
-    /// Obtain a `Cursor` pointing to the first element of the list, or the ghost element if the
-    /// list is empty.
-    #[must_use]
-    pub fn cursor_front(&self) -> Cursor<'_, T> {
-        let mut cursor = self.cursor_ghost();
-        cursor.move_next();
-        cursor
-    }
-
-    /// Obtain a `Cursor` pointing to the last element of the list, or the ghost element if the
-    /// list is empty.
-    #[must_use]
-    pub fn cursor_back(&self) -> Cursor<'_, T> {
-        let mut cursor = self.cursor_ghost();
-        cursor.move_previous();
-        cursor
     }
 
     /// Obtain a `CursorMut` pointing to the "ghost" element of the list.
@@ -306,19 +261,11 @@ impl<T: ?Sized + Types> PinList<T> {
         cursor
     }
 
-    /// Append a node to the front of the list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn push_front<'node>(
+    pub fn acquire_front(
         &mut self,
-        node: Pin<&'node mut Node<T>>,
-        protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        self.cursor_ghost_mut()
-            .insert_after(node, protected, unprotected)
+        acquired: T::Acquired,
+    ) -> Result<(<T as Types>::Protected, AcquiredNode<T>), <T as Types>::Acquired> {
+        self.cursor_front_mut().acquire_current(acquired)
     }
 
     /// Append a node to the back of the list.
@@ -332,8 +279,7 @@ impl<T: ?Sized + Types> PinList<T> {
         protected: T::Protected,
         unprotected: T::Unprotected,
     ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        self.cursor_ghost_mut()
-            .insert_before(node, protected, unprotected)
+        node.insert_before(&mut self.cursor_ghost_mut(), protected, unprotected)
     }
 }
 
@@ -341,116 +287,6 @@ impl<T: ?Sized + Types> PinList<T> {
 impl<T: ?Sized + Types> Debug for PinList<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("PinList").field("id", &self.id).finish()
-    }
-}
-
-/// A shared cursor into a linked list.
-///
-/// This can be created by methods like [`PinList::cursor_ghost`].
-///
-/// Each cursor conceptually points to a single item in the list. It can also point to the space
-/// between the start and end of the list, in which case it is called the ghost cursor.
-///
-/// This type is not `Copy` to prevent accidental copies, but its `Clone` implementation is just a
-/// bitwise copy — very cheap.
-pub struct Cursor<'list, T: ?Sized + Types> {
-    list: &'list PinList<T>,
-    current: OptionNodeShared<T>,
-}
-
-unsafe impl<T: ?Sized + Types> Send for Cursor<'_, T> where
-    // (SAFETY) Required because we hold a shared reference to a `PinList`.
-    PinList<T>: Sync
-{
-}
-
-unsafe impl<T: ?Sized + Types> Sync for Cursor<'_, T> where
-    // (SAFETY) Required because we hold a shared reference to a `PinList`.
-    PinList<T>: Sync
-{
-}
-
-impl<'list, T: ?Sized + Types> Cursor<'list, T> {
-    fn current_shared(&self) -> Option<&'list NodeShared<T>> {
-        // SAFETY: A cursor always points to a valid node in the list (ensured by
-        // `PinList::cursor`).
-        self.current
-            .get()
-            .map(|current| unsafe { current.as_ref() })
-    }
-    fn current_protected(&self) -> Option<&'list NodeProtected<T>> {
-        // SAFETY: Our shared reference to the list gives us shared access to the protected data of
-        // every node in it.
-        Some(unsafe { &*self.current_shared()?.protected.get() })
-    }
-    fn current_linked(&self) -> Option<&'list NodeLinked<T>> {
-        match self.current_protected()? {
-            NodeProtected::Linked(linked) => Some(linked),
-            NodeProtected::Acquired(..) | NodeProtected::Released(..) => unsafe {
-                debug_unreachable!()
-            },
-        }
-    }
-
-    /// Move the cursor to the next element in the linked list.
-    pub fn move_next(&mut self) {
-        self.current = match self.current_linked() {
-            Some(linked) => linked.next,
-            None => self.list.head,
-        };
-    }
-
-    /// Move the cursor to the previous element in the linked list.
-    pub fn move_previous(&mut self) {
-        self.current = match self.current_linked() {
-            Some(linked) => linked.prev,
-            None => self.list.tail,
-        };
-    }
-
-    /// Retrieve a shared reference to the list this cursor uses.
-    #[must_use]
-    pub fn list(&self) -> &'list PinList<T> {
-        self.list
-    }
-
-    /// Retrieve a shared reference to the protected data of this linked list node.
-    ///
-    /// Returns [`None`] if the cursor is the ghost cursor.
-    #[must_use]
-    pub fn protected(&self) -> Option<&'list T::Protected> {
-        Some(&self.current_linked()?.data)
-    }
-
-    /// Retrieve a shared reference to the unprotected data of this linked list node.
-    ///
-    /// Returns [`None`] if the cursor is the ghost cursor.
-    #[must_use]
-    pub fn unprotected(&self) -> Option<&'list T::Unprotected> {
-        Some(&self.current_shared()?.unprotected)
-    }
-}
-
-impl<T: ?Sized + Types> Clone for Cursor<'_, T> {
-    fn clone(&self) -> Self {
-        Self {
-            list: self.list,
-            current: self.current,
-        }
-    }
-}
-
-impl<T: ?Sized + Types> Debug for Cursor<'_, T>
-where
-    T::Unprotected: Debug,
-    T::Protected: Debug,
-{
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Cursor")
-            .field("list", &self.list)
-            .field("protected", &self.protected())
-            .field("unprotected", &self.unprotected())
-            .finish()
     }
 }
 
@@ -477,7 +313,7 @@ unsafe impl<T: ?Sized + Types> Sync for CursorMut<'_, T> where
 {
 }
 
-impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
+impl<T: ?Sized + Types> CursorMut<'_, T> {
     fn current_shared(&self) -> Option<&NodeShared<T>> {
         // SAFETY: A cursor always points to a valid node in the list (ensured by
         // `PinList::cursor_mut`).
@@ -526,27 +362,6 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
         }
     }
 
-    /// Downgrade this cursor to its shared form.
-    #[must_use]
-    pub fn into_shared(self) -> Cursor<'list, T> {
-        Cursor {
-            list: self.list,
-            current: self.current,
-        }
-    }
-
-    /// Reborrow this cursor as its shared form.
-    ///
-    /// Note that reborrowing this cursor as another `CursorMut` is disallowed because it would
-    /// allow invalidating this cursor while it still exists.
-    #[must_use]
-    pub fn as_shared(&self) -> Cursor<'_, T> {
-        Cursor {
-            list: self.list,
-            current: self.current,
-        }
-    }
-
     /// Move the cursor to the next element in the linked list.
     pub fn move_next(&mut self) {
         self.current = *self.next_mut();
@@ -571,161 +386,12 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
         Some(&self.current_linked()?.data)
     }
 
-    /// Retrieve a unique reference to the protected data of this linked list node.
-    ///
-    /// Returns [`None`] if the cursor is currently the ghost cursor.
-    #[must_use]
-    pub fn protected_mut(&mut self) -> Option<&mut T::Protected> {
-        Some(&mut self.current_linked_mut()?.data)
-    }
-
     /// Retrieve a shared reference to the unprotected data of this linked list node.
     ///
     /// Returns [`None`] if the cursor is currently the ghost cursor.
     #[must_use]
     pub fn unprotected(&self) -> Option<&T::Unprotected> {
         Some(&self.current_shared()?.unprotected)
-    }
-
-    /// Insert a node into the linked list before this one.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn insert_before<'node>(
-        &mut self,
-        node: Pin<&'node mut Node<T>>,
-        protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        node.insert_before(self, protected, unprotected)
-    }
-
-    /// Insert a node into the linked list after this one.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn insert_after<'node>(
-        &mut self,
-        node: Pin<&'node mut Node<T>>,
-        protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        node.insert_after(self, protected, unprotected)
-    }
-
-    /// Append a node to the front of the list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn push_front<'node>(
-        &mut self,
-        node: Pin<&'node mut Node<T>>,
-        protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        self.list.push_front(node, protected, unprotected)
-    }
-
-    /// Append a node to the back of the list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn push_back<'node>(
-        &mut self,
-        node: Pin<&'node mut Node<T>>,
-        protected: T::Protected,
-        unprotected: T::Unprotected,
-    ) -> Pin<&'node mut InitializedNode<'node, T>> {
-        self.list.push_back(node, protected, unprotected)
-    }
-
-    /// Remove this node from the linked list with a given "removed" value.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the cursor is currently the ghost cursor (not over an item).
-    pub fn release_current(&mut self, removed: T::Released) -> Result<T::Protected, T::Released> {
-        let mut res = Err(removed);
-        self.release_current_with(|protected| match mem::replace(&mut res, Ok(protected)) {
-            Ok(..) => unsafe { debug_unreachable!() },
-            Err(removed) => removed,
-        });
-        res
-    }
-
-    /// Remove this node from the linked list, computing its "removed" value from a closure.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    ///
-    /// If the given closure panics, the process will abort.
-    ///
-    /// Returns whether the operation was successful — it fails if the cursor is currently a ghost
-    /// cursor (not over an item).
-    pub fn release_current_with<F>(&mut self, f: F) -> bool
-    where
-        F: FnOnce(T::Protected) -> T::Released,
-    {
-        self.release_current_with_or(f, || abort())
-    }
-
-    /// Remove this node from the linked list, computing its "removed" value from a closure, or
-    /// using a secondary closure should the first panic. If the secondary closure panics, the
-    /// process will abort.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    ///
-    /// Returns whether the operation was successful — it fails if the cursor is currently a ghost
-    /// cursor (not over an item).
-    pub fn release_current_with_or<F, Fallback>(&mut self, f: F, fallback: Fallback) -> bool
-    where
-        F: FnOnce(T::Protected) -> T::Released,
-        Fallback: FnOnce() -> T::Released,
-    {
-        let protected: *mut NodeProtected<T> = match self.current_protected_mut() {
-            Some(protected) => protected,
-            None => return false,
-        };
-
-        // Take the protected data so we can do things to it.
-        // SAFETY: Control flow cannot exit this function until a value is placed into `protected`
-        // by `ptr::write`.
-        let old = match unsafe { ptr::read(protected) } {
-            NodeProtected::Linked(linked) => linked,
-            NodeProtected::Acquired(..) | NodeProtected::Released(..) => unsafe {
-                debug_unreachable!()
-            },
-        };
-
-        // Remove ourselves from the list.
-        *unsafe { self.list.cursor_mut(old.prev) }.next_mut() = old.next;
-        *unsafe { self.list.cursor_mut(old.next) }.prev_mut() = old.prev;
-
-        // Move the cursor to the next element in the list
-        self.current = old.next;
-
-        // This guard makes sure to always set the current node's state to removed even if `f`
-        // panics.
-        let guard = run_on_drop(|| {
-            // Since this only runs when the thread is already panicking, `fallback()` panicking
-            // results in a double-panic which leads to an abort.
-            let removed = NodeReleased { data: fallback() };
-            unsafe { ptr::write(protected, NodeProtected::Released(removed)) };
-        });
-
-        // Calculate the new user data and set the state to to removed.
-        let removed = NodeReleased { data: f(old.data) };
-        unsafe { ptr::write(protected, NodeProtected::Released(removed)) };
-
-        // Disarm the guard now that `protected` holds a valid value again.
-        mem::forget(guard);
-
-        true
     }
 
     /// Remove this node from the linked list with a given "removed" value.
@@ -739,53 +405,10 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
         &mut self,
         acquired: T::Acquired,
     ) -> Result<(T::Protected, AcquiredNode<T>), T::Acquired> {
-        let mut res = Err(acquired);
-        let node =
-            self.acquire_current_with(|protected| match mem::replace(&mut res, Ok(protected)) {
-                Ok(..) => unsafe { debug_unreachable!() },
-                Err(acquired) => acquired,
-            });
-
-        match (node, res) {
-            (None, Err(e)) => Err(e),
-            (Some(node), Ok(protected)) => Ok((protected, node)),
-            _ => unsafe { debug_unreachable!() },
-        }
-    }
-
-    /// Remove this node from the linked list, computing its "removed" value from a closure.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    ///
-    /// If the given closure panics, the process will abort.
-    ///
-    /// Returns whether the operation was successful — it fails if the cursor is currently a ghost
-    /// cursor (not over an item).
-    pub fn acquire_current_with<F>(&mut self, f: F) -> Option<AcquiredNode<T>>
-    where
-        F: FnOnce(T::Protected) -> T::Acquired,
-    {
-        self.acquire_current_with_or(f, || abort())
-    }
-
-    /// Remove this node from the linked list, computing its "removed" value from a closure, or
-    /// using a secondary closure should the first panic. If the secondary closure panics, the
-    /// process will abort.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    ///
-    /// Returns whether the operation was successful — it fails if the cursor is currently a ghost
-    /// cursor (not over an item).
-    pub fn acquire_current_with_or<F, Fallback>(
-        &mut self,
-        f: F,
-        fallback: Fallback,
-    ) -> Option<AcquiredNode<T>>
-    where
-        F: FnOnce(T::Protected) -> T::Acquired,
-        Fallback: FnOnce() -> T::Acquired,
-    {
-        let protected: *mut NodeProtected<T> = self.current_protected_mut()?;
+        let protected: *mut NodeProtected<T> = match self.current_protected_mut() {
+            Some(x) => x,
+            None => return Err(acquired),
+        };
 
         // Take the protected data so we can do things to it.
         // SAFETY: Control flow cannot exit this function until a value is placed into `protected`
@@ -805,26 +428,18 @@ impl<'list, T: ?Sized + Types> CursorMut<'list, T> {
         let acquired_node = self.current.0;
         self.current = old.next;
 
-        // This guard makes sure to always set the current node's state to removed even if `f`
-        // panics.
-        let guard = run_on_drop(|| {
-            // Since this only runs when the thread is already panicking, `fallback()` panicking
-            // results in a double-panic which leads to an abort.
-            let acquired = NodeAcquired { data: fallback() };
-            unsafe { ptr::write(protected, NodeProtected::Acquired(acquired)) };
-        });
-
         // Calculate the new user data and set the state to to removed.
-        let acquired = NodeAcquired { data: f(old.data) };
+        let old_data = old.data;
+        let acquired = NodeAcquired { data: acquired };
         unsafe { ptr::write(protected, NodeProtected::Acquired(acquired)) };
 
-        // Disarm the guard now that `protected` holds a valid value again.
-        mem::forget(guard);
-
-        Some(AcquiredNode {
-            node: acquired_node,
-            list_id: self.list.id,
-        })
+        Ok((
+            old_data,
+            AcquiredNode {
+                node: acquired_node,
+                list_id: self.list.id,
+            },
+        ))
     }
 }
 
@@ -906,45 +521,6 @@ impl<T: ?Sized + Types> AcquiredNode<T> {
     ///
     /// Fails if the cursor is currently the ghost cursor (not over an item).
     pub fn release_current(self, list: &mut PinList<T>, removed: T::Released) -> T::Acquired {
-        let mut res = Err(removed);
-        self.release_current_with(list, |protected| {
-            match mem::replace(&mut res, Ok(protected)) {
-                Ok(..) => unsafe { debug_unreachable!() },
-                Err(removed) => removed,
-            }
-        });
-        unsafe { res.unwrap_unchecked() }
-    }
-
-    /// Remove this node from the linked list, computing its "removed" value from a closure.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    ///
-    /// If the given closure panics, the process will abort.
-    ///
-    /// Returns whether the operation was successful — it fails if the cursor is currently a ghost
-    /// cursor (not over an item).
-    pub fn release_current_with<F>(self, list: &mut PinList<T>, f: F)
-    where
-        F: FnOnce(T::Acquired) -> T::Released,
-    {
-        self.release_current_with_or(list, f, || abort());
-    }
-
-    /// Remove this node from the linked list, computing its "removed" value from a closure, or
-    /// using a secondary closure should the first panic. If the secondary closure panics, the
-    /// process will abort.
-    ///
-    /// The cursor is moved to point to the next element in the linked list.
-    pub fn release_current_with_or<F, Fallback>(
-        self,
-        list: &mut PinList<T>,
-        f: F,
-        fallback: Fallback,
-    ) where
-        F: FnOnce(T::Acquired) -> T::Released,
-        Fallback: FnOnce() -> T::Released,
-    {
         let protected: *mut NodeProtected<T> = self.current_protected_mut(list);
 
         // Take the protected data so we can do things to it.
@@ -957,57 +533,12 @@ impl<T: ?Sized + Types> AcquiredNode<T> {
             },
         };
 
-        // This guard makes sure to always set the current node's state to removed even if `f`
-        // panics.
-        let guard = run_on_drop(|| {
-            // Since this only runs when the thread is already panicking, `fallback()` panicking
-            // results in a double-panic which leads to an abort.
-            let removed = NodeReleased { data: fallback() };
-            unsafe { ptr::write(protected, NodeProtected::Released(removed)) };
-        });
-
         // Calculate the new user data and set the state to to removed.
-        let removed = NodeReleased { data: f(old.data) };
+        let old_data = old.data;
+        let removed = NodeReleased { data: removed };
         unsafe { ptr::write(protected, NodeProtected::Released(removed)) };
 
-        // Disarm the guard now that `protected` holds a valid value again.
-        mem::forget(guard);
-    }
-
-    /// Insert this node into the linked list before the given cursor.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the node is not in its initial state.
-    pub fn insert_before(
-        self,
-        cursor: &mut CursorMut<'_, T>,
-        protected: T::Protected,
-    ) -> T::Acquired {
-        let node = self.node;
-        let prev = *cursor.prev_mut();
-
-        let shared = self.current_protected_mut(cursor.list);
-
-        let linked = NodeProtected::Linked(NodeLinked {
-            prev,
-            next: cursor.current,
-            data: protected,
-        });
-
-        let acquired = match mem::replace(shared, linked) {
-            NodeProtected::Acquired(node_acquired) => node_acquired.data,
-            NodeProtected::Linked(..) | NodeProtected::Released(..) => unsafe {
-                debug_unreachable!()
-            },
-        };
-
-        // Update the previous node's `next` pointer and the next node's `prev` pointer to both
-        // point to us.
-        *unsafe { cursor.list.cursor_mut(prev) }.next_mut() = OptionNodeShared::some(node);
-        *cursor.prev_mut() = OptionNodeShared::some(node);
-
-        acquired
+        old_data
     }
 
     /// Insert this node into the linked list after the given cursor.
