@@ -8,13 +8,10 @@ It does so with 0 allocations per task, and intends to allow in-place initialisa
 ```rust
 #[tokio::main]
 async fn main() {
-    let plunger = plunger::Plunger::new();
-
     let hash = "$argon2i$v=19$m=65536,t=1,p=1$c29tZXNhbHQAAAAAAAAAAA$+r0d29hqEB0yasKr55ZgICsQGSkl0v0kgwhd+U3wyRo";
     let password = "password";
 
-    plunger
-        .unblock(move || password_auth::verify_password(password, hash))
+    plunger::unblock(move || password_auth::verify_password(password, hash))
         .await
         .unwrap();
 }

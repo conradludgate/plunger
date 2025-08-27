@@ -432,6 +432,7 @@ dependencies = [
  "crossbeam-utils",
  "diatomic-waker",
  "futures",
+ "futures-util",
  "parking_lot",
  "password-auth",
  "pbkdf2",
