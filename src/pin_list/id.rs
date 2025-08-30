@@ -87,6 +87,7 @@ mod checked {
 mod debug_checked {
     use super::Id;
     use super::Unique;
+    #[cfg(debug_assertions)]
     use crate::pin_list::id;
 
     /// Equivalent to [`id::Checked`] when `debug_assertions` are enabled, but equivalent to

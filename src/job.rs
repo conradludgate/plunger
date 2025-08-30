@@ -10,7 +10,7 @@ use std::{
 use parking_lot::MutexGuard;
 use pinned_aliasable::Aliasable;
 
-use crate::{JobComplete, PlungerQueue, Types, pin_list::AcquiredNode};
+use crate::{PlungerQueue, Types, pin_list::AcquiredNode};
 
 pub(super) struct RawDynJob<Ctx> {
     job: *mut (dyn JobErased<Ctx> + Send),
@@ -54,7 +54,12 @@ impl<Ctx> RawDynJob<Ctx> {
     }
 }
 
-pub(super) trait JobErased<Ctx> {
+pub enum JobComplete {
+    Success,
+    Panic,
+}
+
+pub trait JobErased<Ctx> {
     /// # Safety
     /// After returning Ready or panicking, this should never be called again.
     unsafe fn poll(&mut self, ctx: &mut Ctx) -> Poll<()>;
@@ -75,7 +80,7 @@ pub(super) trait JobErased<Ctx> {
     }
 }
 
-pub(super) trait Job<Ctx>: JobErased<Ctx> {
+pub trait Job<Ctx>: JobErased<Ctx> {
     type Output;
 
     unsafe fn discard_init(&mut self);
@@ -84,8 +89,8 @@ pub(super) trait Job<Ctx>: JobErased<Ctx> {
     unsafe fn discard_unwind(&mut self);
 }
 
-pub(super) struct Once<F, R>(Value<F, R>);
-pub(super) struct Until<F, R>(Value<F, R>);
+pub struct Once<F, R>(Value<F, R>);
+pub struct Until<F, R>(Value<F, R>);
 
 impl<F, R> Once<F, R> {
     pub fn new(f: F) -> Self {

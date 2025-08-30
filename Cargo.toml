@@ -1,6 +1,6 @@
 [package]
 name = "plunger"
-version = "0.1.0-rc.4"
+version = "0.1.0-rc.5"
 authors = ["Conrad Ludgate <conradludgate@gmail.com>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/conradludgate/plunger"
 [features]
 default = ["tokio"]
 tokio = ["dep:tokio"]
+nightly_async_drop = []
 
 [dependencies]
 pinned-aliasable = "0.1"

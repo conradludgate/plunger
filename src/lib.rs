@@ -23,6 +23,8 @@
 //! 1. Cancellation is rare
 //! 2. Tasks run in the range of 100us to 1ms
 //! 3. We can use block_in_place to reduce the impact of blocking when the tokio feature is enabled and using a multithreaded runtime.
+#![cfg_attr(feature = "nightly_async_drop", allow(incomplete_features))]
+#![cfg_attr(feature = "nightly_async_drop", feature(async_drop))]
 
 mod always_send_sync;
 mod block;
@@ -42,8 +44,7 @@ use std::{
 use diatomic_waker::DiatomicWaker;
 use parking_lot::{Condvar, Mutex};
 
-use crate::{job::RawDynJob, pin_list::PinList, task::Task};
-
+pub use task::Task;
 pub use worker::Worker;
 
 static GLOBAL: OnceLock<Plunger> = OnceLock::new();
@@ -62,7 +63,7 @@ static GLOBAL: OnceLock<Plunger> = OnceLock::new();
 /// For this reason, we recommend that you ensure cancellation is rare,
 /// and that tasks run for 100us-1ms to reduce the blocking duration.
 #[inline(always)]
-pub fn unblock<F, R>(task: F) -> impl Future<Output = R>
+pub fn unblock<F, R>(task: F) -> Task<'static, impl job::Job<(), Output = R>>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -86,7 +87,7 @@ where
 /// For this reason, we recommend that you ensure cancellation is rare,
 /// and that tasks run for 100us-1ms to reduce the blocking duration.
 #[inline(always)]
-pub fn unblock_until<F, R>(mut task: F) -> impl Future<Output = R>
+pub fn unblock_until<F, R>(mut task: F) -> Task<'static, impl job::Job<(), Output = R>>
 where
     F: FnMut() -> Poll<R> + Send + 'static,
     R: Send + 'static,
@@ -143,7 +144,17 @@ impl Plunger {
 
     /// Create a new `Plunger` with the given number of threads.
     pub fn with_threads(threads: NonZero<usize>) -> Self {
-        Self::with_ctx(std::iter::repeat_n(|| {}, threads.get()))
+        let this = Self::build();
+
+        for _ in 0..threads.get() {
+            let worker = this.worker();
+            std::thread::Builder::new()
+                .name("plunger-worker".to_owned())
+                .spawn(move || worker.run(()))
+                .unwrap();
+        }
+
+        this
     }
 }
 
@@ -154,44 +165,24 @@ impl Default for Plunger {
 }
 
 impl<Ctx> Plunger<Ctx> {
-    pub fn create() -> (Self, Worker<Ctx>) {
+    /// Create a new `Plunger` with no workers.
+    pub fn build() -> Self {
         let inner = Arc::new(Inner {
             queue: Mutex::new(PlungerQueue {
-                list: PinList::new(unsafe { pin_list::id::DebugChecked::new() }),
+                list: pin_list::PinList::new(unsafe { pin_list::id::DebugChecked::new() }),
                 len: 0,
-                workers: 1,
+                workers: 0,
                 shutdown: None,
             }),
             notify: Condvar::new(),
         });
 
-        let worker = Worker::new(&inner);
-
-        (Self { inner }, worker)
+        Self { inner }
     }
 
-    /// Create a new `Plunger`, using the iterator to define the threads.
-    ///
-    /// ## Context
-    ///
-    /// Worker threads can have a thread local context that can be used for some arbitrary purpose by
-    /// the tasks spawned into the worker. This could be just a scratch space, or it could be a cache,
-    /// or it could be some metrics. The world is your oyster.
-    pub fn with_ctx(ctx: impl IntoIterator<Item = impl FnOnce() -> Ctx + Send + 'static>) -> Self
-    where
-        Ctx: Send + 'static,
-    {
-        let (this, worker) = Self::create();
-
-        for ctx in ctx {
-            let worker = worker.clone();
-            std::thread::Builder::new()
-                .name("plunger-worker".to_owned())
-                .spawn(move || worker.run(ctx()))
-                .unwrap();
-        }
-
-        this
+    /// Create a new [`Worker`] for the `Plunger`.
+    pub fn worker(&self) -> Worker<Ctx> {
+        Worker::new(&self.inner)
     }
 
     /// Steal the contexts from the workers in an arbitrary order and shutdown the thread pool.
@@ -229,7 +220,7 @@ impl<Ctx> Plunger<Ctx> {
     /// For this reason, we recommend that you ensure cancellation is rare,
     /// and that tasks run for 100us-1ms to reduce the blocking duration.
     #[inline(always)]
-    pub fn unblock<F, R>(&self, task: F) -> impl Future<Output = R>
+    pub fn unblock<F, R>(&self, task: F) -> Task<'_, impl job::Job<Ctx, Output = R> + 'static, Ctx>
     where
         Ctx: UnwindSafe,
         F: FnOnce() -> R + Send + 'static,
@@ -254,7 +245,7 @@ impl<Ctx> Plunger<Ctx> {
     /// For this reason, we recommend that you ensure cancellation is rare,
     /// and that tasks run for 100us-1ms to reduce the blocking duration.
     #[inline(always)]
-    pub fn unblock_ctx<F, R>(&self, task: F) -> impl Future<Output = R>
+    pub fn unblock_ctx<F, R>(&self, task: F) -> Task<'_, job::Once<F, R>, Ctx>
     where
         Ctx: UnwindSafe,
         F: FnOnce(&mut Ctx) -> R + Send + 'static,
@@ -281,7 +272,7 @@ impl<Ctx> Plunger<Ctx> {
     /// For this reason, we recommend that you ensure cancellation is rare,
     /// and that tasks run for 100us-1ms to reduce the blocking duration.
     #[inline(always)]
-    pub fn unblock_ctx_until<F, R>(&self, task: F) -> impl Future<Output = R>
+    pub fn unblock_ctx_until<F, R>(&self, task: F) -> Task<'_, job::Until<F, R>, Ctx>
     where
         Ctx: UnwindSafe,
         F: FnMut(&mut Ctx) -> Poll<R> + Send + 'static,
@@ -290,21 +281,24 @@ impl<Ctx> Plunger<Ctx> {
         Task::new(self, crate::job::Until::new(task))
     }
 
+    /// How many workers are currently assigned to this `Plunger`
     pub fn workers(&self) -> usize {
         self.inner.queue.lock().workers
     }
 
+    /// How many tasks are currently queued into this `Plunger`
     pub fn len(&self) -> usize {
         self.inner.queue.lock().len
     }
 
+    /// Return true if there are no tasks queued into this `Plunger`.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
 struct PlungerQueue<Ctx> {
-    list: PinList<Types<Ctx>>,
+    list: pin_list::PinList<Types<Ctx>>,
     len: usize,
     workers: usize,
     shutdown: Option<Shutdown<Ctx>>,
@@ -312,16 +306,11 @@ struct PlungerQueue<Ctx> {
 
 type Types<Ctx> = dyn pin_list::Types<
         Id = pin_list::id::DebugChecked,
-        Protected = RawDynJob<Ctx>,
+        Protected = job::RawDynJob<Ctx>,
         Acquired = bool,
-        Released = JobComplete,
+        Released = job::JobComplete,
         Unprotected = DiatomicWaker,
     >;
-
-enum JobComplete {
-    Success,
-    Panic,
-}
 
 enum Shutdown<Ctx> {
     Drop,
@@ -344,6 +333,7 @@ mod tests {
         num::NonZero,
         pin::pin,
         sync::{Arc, Mutex},
+        thread,
         time::{Duration, Instant},
     };
 
@@ -577,7 +567,7 @@ mod tests {
             async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
 
-                if cfg!(feature = "tokio") {
+                if cfg!(feature = "tokio") || cfg!(feature = "nightly_async_drop") {
                     // check that the tokio worker thread was not blocked.
                     assert_eq!(*first_state.lock().unwrap(), 1);
                 } else {
@@ -629,21 +619,32 @@ mod tests {
     #[test]
     fn shutdown() {
         let wg = WaitGroup::new();
-        let plunger = Plunger::with_ctx(
-            std::iter::from_fn(|| Some(wg.clone()))
-                .map(|wg| move || wg)
-                .take(8),
-        );
+        let plunger = Plunger::build();
 
-        drop(plunger);
+        thread::scope(|s| {
+            for _ in 0..8 {
+                let worker = plunger.worker();
+                let wg = wg.clone();
+                s.spawn(|| worker.run(wg));
+            }
 
-        wg.wait();
+            drop(plunger);
+            wg.wait();
+        });
     }
 
     #[test]
     fn take_context() {
-        let plunger = Plunger::with_ctx([|| 1, || 2, || 3, || 4, || 5, || 6, || 7, || 8]);
-        let mut ctx = plunger.steal_contexts();
+        let plunger = Plunger::build();
+
+        let mut ctx = thread::scope(|s| {
+            for i in 1..=8 {
+                let worker = plunger.worker();
+                s.spawn(move || worker.run(i));
+            }
+
+            plunger.steal_contexts()
+        });
 
         ctx.sort_unstable();
         assert_eq!(ctx, vec![1, 2, 3, 4, 5, 6, 7, 8]);

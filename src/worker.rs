@@ -2,15 +2,14 @@ use std::sync::Arc;
 
 use crate::{Inner, Shutdown};
 
-pub struct Worker<Ctx> {
+/// The worker state for a [`Plunger`](crate::Plunger)
+pub struct Worker<Ctx = ()> {
     inner: Arc<Inner<Ctx>>,
 }
 
 impl<Ctx> Clone for Worker<Ctx> {
     fn clone(&self) -> Self {
-        let inner = self.inner.clone();
-        inner.queue.lock().workers += 1;
-        Self { inner }
+        Worker::new(&self.inner)
     }
 }
 
@@ -22,9 +21,9 @@ impl<Ctx> Drop for Worker<Ctx> {
 
 impl<Ctx> Worker<Ctx> {
     pub(super) fn new(inner: &Arc<Inner<Ctx>>) -> Self {
-        Self {
-            inner: inner.clone(),
-        }
+        let inner = inner.clone();
+        inner.queue.lock().workers += 1;
+        Self { inner }
     }
 
     /// Run a worker thread.
