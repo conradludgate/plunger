@@ -305,12 +305,12 @@ struct PlungerQueue<Ctx> {
 }
 
 type Types<Ctx> = dyn pin_list::Types<
-        Id = pin_list::id::DebugChecked,
-        Protected = job::RawDynJob<Ctx>,
-        Acquired = bool,
-        Released = job::JobComplete,
-        Unprotected = DiatomicWaker,
-    >;
+    Id = pin_list::id::DebugChecked,
+    Protected = job::RawDynJob<Ctx>,
+    Acquired = bool,
+    Released = job::JobComplete,
+    Unprotected = DiatomicWaker,
+>;
 
 enum Shutdown<Ctx> {
     Drop,
