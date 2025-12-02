@@ -25,7 +25,14 @@ impl<Ctx> RawDynJob<Ctx> {
         F: JobErased<Ctx> + Send,
     {
         let job = NonNull::from(job.get()).as_ptr().cast::<F>();
-        Self { job: job as _ }
+        Self {
+            job: unsafe {
+                std::mem::transmute::<
+                    *mut (dyn JobErased<Ctx> + Send + '_),
+                    *mut (dyn JobErased<Ctx> + Send + 'static),
+                >(job)
+            },
+        }
     }
 
     pub(super) fn run_job(
