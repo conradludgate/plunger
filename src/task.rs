@@ -136,6 +136,9 @@ impl<Ctx, J: job::Job<Ctx>> Task<'_, J, Ctx> {
         };
 
         let Some(mut node) = this.node.as_mut().initialized_mut() else {
+            // Mark cancellation complete before dropping user data, including
+            // when its destructor unwinds. Neither polling nor Drop may reuse it.
+            *this.plunger = None;
             // safety: state is Init, so we own this.
             let task_state = unsafe { &mut *this.state.as_ref().get().get() };
             unsafe { task_state.discard_init() }
