@@ -161,6 +161,9 @@ impl<Ctx, J: job::Job<Ctx>> Task<'_, J, Ctx> {
             }
         };
 
+        if matches!(data, NodeData::Linked(_)) {
+            guard.len -= 1;
+        }
         drop(guard);
 
         *this.plunger = None;
@@ -215,6 +218,9 @@ impl<Ctx, J: job::Job<Ctx>> Task<'_, J, Ctx> {
             }
         };
 
+        if matches!(data, NodeData::Linked(_)) {
+            guard.len -= 1;
+        }
         drop(guard);
 
         *this.plunger = None;
